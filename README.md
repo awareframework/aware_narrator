@@ -5,19 +5,19 @@ AWARE Narrator is a comprehensive Python toolkit that processes sensor data from
 
 ## Manual Setup Requirements
 
-### Google Maps Geocoding Update
-Due to recent changes in the Google Maps Services Python library, you may need to manually update the geocoding module:
+### Google Maps Geocoding Update (Only if using Google Maps API)
+If you plan to use Google Maps API for reverse geocoding (requires a valid API key in `config.yaml`), you may need to manually update the geocoding module due to recent changes in the Google Maps Services Python library:
 
 1. Check for updates on the GitHub repository: https://github.com/googlemaps/google-maps-services-python.git
-2. Find your local geocoding.py file path (typically in your conda/pip environment)
-   - Example: `/home/ubuntu/miniforge3/envs/student/lib/python3.13/site-packages/googlemaps/geocoding.py`
+2. Find your local geocoding.py file path (typically in your conda/mamba environment)
+   - Example: `/home/ubuntu/miniforge3/envs/your_envname/lib/python3.13/site-packages/googlemaps/geocoding.py`
 3. Replace your local geocoding.py with the latest version from: https://github.com/googlemaps/google-maps-services-python/blob/master/googlemaps/geocoding.py
 
 **Alternative:** A copy of the updated `geocoding.py` file has been included in this project for convenience. You can copy it directly to replace the installed package in your current environment:
 
 ```bash
 # Make sure you're in the correct environment first
-conda activate your_environment_name  # or source venv/bin/activate for pip
+conda activate your_environment_name  # or mamba activate your_environment_name
 
 # Find your googlemaps package location in the current environment
 python -c "import googlemaps; print(googlemaps.__file__)"
@@ -27,10 +27,34 @@ cp geocoding.py $(python -c "import googlemaps; import os; print(os.path.dirname
 
 This manual update ensures compatibility with the address descriptor feature in geocoding.py
 
+**Note:** This setup is only required if you plan to use Google Maps API for reverse geocoding. If you leave the `GOOGLE_MAP_KEY` empty in your `config.yaml`, the toolkit will work without this update.
+
 
 ## Installation
 
-This project supports both **Conda** and **pip** for managing and installing dependencies. Follow the instructions below to set up your environment.
+This project supports **Mamba** and **Conda** for managing and installing dependencies. We recommend using Mamba for faster package resolution and installation.
+
+### Using Mamba (Recommended)
+
+1. Ensure you have [Mamba](https://mamba.readthedocs.io/en/latest/installation.html) installed.
+2. Activate your Mamba environment (or create one if needed):
+
+   ```bash
+   mamba create -n my_env python=3.13
+   mamba activate my_env
+   ```
+3. Create (or update) your environment from the file:
+
+   ```bash
+   # Create a new environment with the name defined in the file:
+   mamba env create --file environment.yml
+
+   # Or create under a custom name:
+   mamba env create -n <your_env_name> --file environment.yml
+
+   # To update an existing environment to match environment.yml:
+   mamba env update -n <your_env_name> --file environment.yml --prune
+   ```
 
 ### Using Conda
 
@@ -43,7 +67,7 @@ This project supports both **Conda** and **pip** for managing and installing dep
    ```
 3. Create (or update) your environment from the file:
 
-   ````bash
+   ```bash
    # Create a new environment with the name defined in the file:
    conda env create --file environment.yml
 
@@ -52,39 +76,13 @@ This project supports both **Conda** and **pip** for managing and installing dep
 
    # To update an existing environment to match environment.yml:
    conda env update -n <your_env_name> --file environment.yml --prune
-   ```bash
-   conda env update --file environment.yml --prune
-   ````
+   ```
 
 > **Note:** `environment.yml` was generated with:
 >
 > ```bash
 > conda env export --from-history > environment.yml
 > ```
-
-### Using pip
-
-1. Ensure you have Python 3.13 installed.
-2. (Optional) Create and activate a virtual environment:
-
-   ```bash
-   python -m venv venv
-   source venv/bin/activate   # on Linux/macOS
-   venv\\Scripts\\activate  # on Windows
-   ```
-3. Install all pip dependencies:
-
-   ```bash
-   pip install --upgrade pip
-   pip install -r requirements.txt
-   ```
-
-> **Tip:** To generate `requirements.txt`, run:
->
-> ```bash
-> pip freeze > requirements.txt
-> ```
-
 
 
 ## Project Structure
@@ -443,12 +441,12 @@ The toolkit analyzes the following sensor types:
 ## Troubleshooting
 
 - **JSONDecodeError**: Ensure `config.yaml` is properly formatted YAML (no JSON-style comments)
-- **ModuleNotFoundError**: Install dependencies using `pip install -r requirements.txt`
-- **Google Maps API errors**: Ensure a valid API key is provided in `GOOGLE_MAP_KEY`
+- **ModuleNotFoundError**: Install dependencies using `mamba env create --file environment.yml` or `conda env create --file environment.yml`
+- **Google Maps API errors**: Ensure a valid API key is provided in `GOOGLE_MAP_KEY` (or leave empty if not using Google Maps API)
 - **File not found errors**: Check that participant data follows the expected directory structure
 - **Session data missing**: Run `extract_sessions.py` first to generate session boundaries
 - **Empty sensor files**: Verify JSONL files contain valid JSON objects, one per line
-- **Geocoding issues**: If you encounter geocoding errors, follow the manual setup instructions above to update the geocoding.py file
+- **Geocoding issues**: If you encounter geocoding errors and are using Google Maps API, follow the manual setup instructions above to update the geocoding.py file
 
 ## License
 This project is for research purposes. Contact the developers for usage permissions.
