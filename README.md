@@ -9,15 +9,15 @@ AWARE Narrator is a comprehensive Python toolkit that processes sensor data from
 If you plan to use Google Maps API for reverse geocoding (requires a valid API key in `config.yaml`), you may need to manually update the geocoding module due to recent changes in the Google Maps Services Python library:
 
 1. Check for updates on the GitHub repository: https://github.com/googlemaps/google-maps-services-python.git
-2. Find your local geocoding.py file path (typically in your conda/mamba environment)
-   - Example: `/home/ubuntu/miniforge3/envs/your_envname/lib/python3.13/site-packages/googlemaps/geocoding.py`
+2. Find your local geocoding.py file path (typically in your mamba/conda environment)
+   - Example: `/home/ubuntu/miniforge3/envs/mv_env/lib/python3.13/site-packages/googlemaps/geocoding.py`
 3. Replace your local geocoding.py with the latest version from: https://github.com/googlemaps/google-maps-services-python/blob/master/googlemaps/geocoding.py
 
 **Alternative:** A copy of the updated `geocoding.py` file has been included in this project for convenience. You can copy it directly to replace the installed package in your current environment:
 
 ```bash
 # Make sure you're in the correct environment first
-conda activate your_environment_name  # or mamba activate your_environment_name
+mamba activate my_env  # or conda activate my_env
 
 # Find your googlemaps package location in the current environment
 python -c "import googlemaps; print(googlemaps.__file__)"
@@ -50,10 +50,10 @@ This project supports **Mamba** and **Conda** for managing and installing depend
    mamba env create --file environment.yml
 
    # Or create under a custom name:
-   mamba env create -n <your_env_name> --file environment.yml
+   mamba env create -n <my_env> --file environment.yml
 
    # To update an existing environment to match environment.yml:
-   mamba env update -n <your_env_name> --file environment.yml --prune
+   mamba env update -n <my_env> --file environment.yml --prune
    ```
 
 ### Using Conda
@@ -72,10 +72,10 @@ This project supports **Mamba** and **Conda** for managing and installing depend
    conda env create --file environment.yml
 
    # Or create under a custom name:
-   conda env create -n <your_env_name> --file environment.yml
+   conda env create -n <my_env> --file environment.yml
 
    # To update an existing environment to match environment.yml:
-   conda env update -n <your_env_name> --file environment.yml --prune
+   conda env update -n <mv_env> --file environment.yml --prune
    ```
 
 > **Note:** `environment.yml` was generated with:
