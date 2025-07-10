@@ -1,35 +1,37 @@
-name: student
+name: test
 channels:
   - conda-forge
   - defaults
 dependencies:
   # Base Python and essential system libraries
-  - python=3.13.2
+  - python=3.13
   - pip
   
   # Scientific computing stack from conda
-  - numpy=2.2.6
-  - scipy=1.15.3
+  - numpy
+  - scipy
+  - pandas
   
   # Additional conda packages for better performance
-  - mkl=2023.1.0
-  - mkl-service=2.4.0
-  - mkl_fft=1.3.11
-  - mkl_random=1.2.8
+  - mkl
+  - mkl-service
+  - mkl_fft
+  - mkl_random
+  
+  # Data visualization (install via conda to avoid build issues)
+  - matplotlib
+  - seaborn
   
   # Install remaining dependencies via pip
   - pip:
-      # Data processing and analysis
-      - pandas==2.2.3
-      
-      # Scientific computing and astronomy calculations  
-      - astropy==7.1.0
-      - scikit-learn==1.6.1
+      # Scientific computing and machine learning
+      - astropy
+      - scikit-learn
       
       # Geographic and location processing
-      - geopy==2.4.1
-      - googlemaps==4.10.0
+      - geopy
+      - googlemaps
       
       # Configuration and time handling
-      - PyYAML==6.0.2
-      - pytz==2025.2
+      - PyYAML
+      - pytz

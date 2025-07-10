@@ -153,7 +153,7 @@ def split_sensor_data(input_file, output_folder):
             print(f"Error writing to {output_file}: {e}")
 
 def main():
-    input_file = "description/SS002_output.txt"
+    input_file = "description/SS001_output.txt"
     output_folder = "description_split"
     
     # Extract PID for display purposes

@@ -10,5 +10,10 @@ __pycache__/
 resources/
 daily_description
 description
+description_split
 participant_data
 config.yaml
+step1_data/
+distance_calculator.py
+example_usage.py
+locations_query_results/

@@ -1,5 +1,32 @@
+2025-07-10
+- Manual setup:
+    - Check updates on the github repo https://github.com/googlemaps/google-maps-services-python.git
+    - Replace your local geocoding.py by finding the path
+        -E.g.,  /home/ubuntu/miniforge3/envs/student/lib/python3.13/site-packages/googlemaps/geocoding.py by the latest script from the repo
+    - https://github.com/googlemaps/google-maps-services-python/blob/master/googlemaps/geocoding.py
+- Updated aware_narrator.py
+    - Location: 
+        - Includec days without nighttime points
+        - Implement address descriptors
+        - Better readability
+        - Filter out a visited place with 2 thresholds
+            - Minimum data points:
+                - Loaded from location_minimum_data_points in config.yaml 
+                    - E.g., at least 3 points to display a place in location description
+            - Minimum stay duration:
+                - Loaded from location_minimum_stay_minutes in config.yaml
+                    - E.g., at least to stay 5 minutes to display a place in location description
+        - Merged visit count, perioud, and sequence after fitering.
+    - Bluetooth and WIFI
+        - To show up to 10 most frequency detected named devices
+
+- Added screen text preprocess pipeline
+- Added geocoding.py for manual setup
+
+- Updated README.md and config.yaml
+
 2025-07-09
-- Updated sensor_narrator.py
+- Updated aware_narrator.py
     - Location: clean up redundant code; allows skip when no location data avaliable.
     - Implemented daily splitation
     - Support mulitple participants

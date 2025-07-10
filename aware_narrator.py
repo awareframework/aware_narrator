@@ -5,7 +5,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 import json
 import numpy as np
-from astropy import units as u
 from sklearn.cluster import DBSCAN
 from geopy.distance import geodesic
 import googlemaps
@@ -71,6 +70,8 @@ min_samples = CONFIG["min_samples"]
 DISCARD_SYSTEM_UI = CONFIG["DISCARD_SYSTEM_UI"]
 night_time_start = CONFIG["night_time_start"]
 night_time_end = CONFIG["night_time_end"]
+location_minimum_data_points = CONFIG.get("location_minimum_data_points", 3)  # Minimum location data points to display a location
+location_minimum_stay_minutes = CONFIG.get("location_minimum_stay_minutes", 5)  # Minimum stay duration to display a location
 
 blacklist_apps = CONFIG["blacklist_apps"]
 whitelist_system_apps = CONFIG["whitelist_system_apps"]
@@ -102,10 +103,12 @@ def process_participant(P_ID):
     input_directory = CONFIG["input_directory"].format(P_ID=P_ID)
     output_file = CONFIG["output_file"].format(P_ID=P_ID)
     daily_output_dir = CONFIG["daily_output_dir"].format(P_ID=P_ID)
+    reverse_geocoding_output_dir = CONFIG["reverse_geocoding_output_dir"].format(P_ID=P_ID)
     
     # Ensure output directories exist
     os.makedirs(daily_output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    os.makedirs(reverse_geocoding_output_dir, exist_ok=True)
     
     jsonl_files = [(f"{sensor}.jsonl", sensor) for sensor in sensors]
     
@@ -288,12 +291,11 @@ def process_participant(P_ID):
         except Exception as e:
             print(f"Unexpected error during clustering: {e}")
             print("Skipping location clustering due to error.")
-        
-        # Close the conditional block for location processing
-        else:
-            print("No location data available for clustering")
+    else:
+        print("No location data available for clustering")
 
     # If a Google Maps API key is provided, perform reverse geocoding for all places
+    reverse_geocoding_performed = False
     if GOOGLE_MAP_KEY and cluster:
         gmaps = googlemaps.Client(key=GOOGLE_MAP_KEY)
         # a list to store all reverse geocoding results
@@ -320,51 +322,155 @@ def process_participant(P_ID):
                 if not reverse_geocode_data or reverse_geocode_data.get("status") != "OK":
                     print(f"No valid address returned for ({center_lat}, {center_lon}).")
                     continue
-
+                
                 # Process the reverse geocoding data
                 reverse_geocode_results.append(reverse_geocode_data)
-                data = reverse_geocode_data.get("results")[0] # get the most relevant result
+                data = reverse_geocode_data["results"][0]
                 formatted_address = data.get("formatted_address", "")
 
-                # Extract place information from address components
-                place_type = ""
-                place_name = ""
-                for component in data.get("address_components", []):
-                    if isinstance(component, dict) and component.get("types"):
-                        types_list = component["types"]
-                        if types_list and len(types_list) > 0:
-                            place_type = types_list[0] or ""
-                        place_name = component.get('long_name', '')
-                        break
+                # enum→phrase maps
+                rel_phrases = {
+                    "NEAR": "near",
+                    "WITHIN": "within",
+                    "BESIDE": "beside",
+                    "ACROSS_THE_ROAD": "across the road from",
+                    "DOWN_THE_ROAD": "down the road from",
+                    "AROUND_THE_CORNER": "around the corner from",
+                    "BEHIND": "behind",
+                }
+                cont_phrases = {
+                    "NEAR": "near",
+                    "WITHIN": "within",
+                    "OUTSKIRTS": "on the outskirts of",
+                }
 
-                # Combine strings with proper spacing, filtering out empty strings
-                parts = [part for part in [place_type, place_name, formatted_address] if part.strip()]
-                geocoded_place = ", ".join(parts)
-                
-                # If this is the home cluster, keep "home" label and append geocoded result
-                if place == "home":
-                    updated_place = f"home, {geocoded_place}"
+                desc = reverse_geocode_data.get("address_descriptor", {})
+                landmarks = desc.get("landmarks", [])
+                areas     = desc.get("areas", [])
+
+                # build the "area" piece - display all areas in original order
+                area_parts = []
+                if areas:
+                    for ar in areas:
+                        name = ar["display_name"]["text"]
+                        cont = cont_phrases.get(ar["containment"], ar["containment"].lower())
+                        area_parts.append(f"{cont} {name}")
+                    ar_part = "Areas: " + ", ".join(area_parts)
                 else:
-                    # For unknown places, replace with geocoded result
-                    updated_place = geocoded_place
+                    ar_part = ""
+
+                # build the "landmark" piece (only the first one)
+                if landmarks:
+                    lm = landmarks[0]
+                    name = lm["display_name"]["text"]
+                    rel  = rel_phrases.get(lm["spatial_relationship"], lm["spatial_relationship"].lower())
+                    dist = lm["straight_line_distance_meters"]
+                    lm_part = f"Landmarks: {rel} {name} ({dist:.1f} m away)"
+                else:
+                    lm_part = ""
+
+                # combine area and landmark descriptions, do not show empty
+                desc_parts = []
+                if ar_part:
+                    desc_parts.append(ar_part)
+                if lm_part:
+                    desc_parts.append(lm_part)
+                base_desc = ". ".join(desc_parts)
+
+                # Use formatted address directly
+                full_address = formatted_address
+
+                # append the full address information
+                if base_desc:
+                    full_desc = f"{base_desc}. Address: {full_address}"
+                else:
+                    full_desc = full_address
+
+                # prefix "home." instead of "home,"
+                if place == "home":
+                    updated_place = f"home. {full_desc}"
+                else:
+                    updated_place = full_desc
 
                 # Update cluster data while preserving distance information
-                cluster[idx] = (cluster_id, center_lat, center_lon, num_points, updated_place, distance_from_home)
+                cluster[idx] = (
+                    cluster_id,
+                    center_lat,
+                    center_lon,
+                    num_points,
+                    updated_place,
+                    distance_from_home
+                )
+
+                    
+                # # Process the reverse geocoding data
+                # reverse_geocode_results.append(reverse_geocode_data)
+                # data = reverse_geocode_data.get("results")[0] # get the most relevant result
+                # formatted_address = data.get("formatted_address", "")
+
+                # # Extract place information from address components
+                # place_type = ""
+                # place_name = ""
+                # for component in data.get("address_components", []):
+                #     if isinstance(component, dict) and component.get("types"):
+                #         types_list = component["types"]
+                #         if types_list and len(types_list) > 0:
+                #             place_type = types_list[0] or ""
+                #         place_name = component.get('long_name', '')
+                #         break
+
+                # # Combine strings with proper spacing, filtering out empty strings
+                # parts = [part for part in [place_type, place_name, formatted_address] if part.strip()]
+                # geocoded_place = ", ".join(parts)
+                
+                # # If this is the home cluster, keep "home" label and append geocoded result
+                # if place == "home":
+                #     updated_place = f"home, {geocoded_place}"
+                # else:
+                #     # For unknown places, replace with geocoded result
+                #     updated_place = geocoded_place
+
+                # # Update cluster data while preserving distance information
+                # cluster[idx] = (cluster_id, center_lat, center_lon, num_points, updated_place, distance_from_home)
         except Exception as e:
             print(f"Error in Google Maps API request: {e}")
-        #save reverse geocoding results to a jsonl file with prefix to participant id
-
+        
+        # Save reverse geocoding results to the configured directory
         # Parse the full END_TIME
         start_date = datetime.strptime(START_TIME, '%Y-%m-%d %H:%M:%S').strftime('%Y%m%d%H%M%S')
         end_date = datetime.strptime(END_TIME, '%Y-%m-%d %H:%M:%S').strftime('%Y%m%d%H%M%S')
-        filename = f"{P_ID}_{start_date}_{end_date}_reverse_geocode_results.jsonl"
+        filename = os.path.join(reverse_geocoding_output_dir, f"{P_ID}_{start_date}_{end_date}_reverse_geocode_results.json")
         
         with open(filename, "w", encoding='utf-8') as file:
-            for result in reverse_geocode_results:
-                file.write(json.dumps(result) + "\n")
+            json.dump(reverse_geocode_results, file, indent=2, ensure_ascii=False, default=str)
+        
+        # Create cluster ID to query item mapping
+        cluster_mapping = {}
+        for idx, cluster_data in enumerate(cluster):
+            if len(cluster_data) == 6:
+                cluster_id, center_lat, center_lon, num_points, place, distance_from_home = cluster_data
+                if idx < len(reverse_geocode_results):
+                    # Convert numpy int64 to Python int for JSON serialization
+                    cluster_id_int = int(cluster_id)
+                    cluster_mapping[cluster_id_int] = {
+                        "query_coordinates": (center_lat, center_lon),
+                        "reverse_geocode_result": reverse_geocode_results[idx],
+                        "place_name": place,
+                        "num_points": int(num_points),  # Also convert to ensure compatibility
+                        "distance_from_home_meters": float(distance_from_home)  # Convert to float
+                    }
+        
+        # Save cluster mapping to JSON file
+        mapping_filename = os.path.join(reverse_geocoding_output_dir, f"{P_ID}_{start_date}_{end_date}_cluster_mapping.json")
+        with open(mapping_filename, "w", encoding='utf-8') as file:
+            json.dump(cluster_mapping, file, indent=2, ensure_ascii=False, default=str)
+        
+        print(f"Saved reverse geocoding results to: {filename}")
+        print(f"Saved cluster mapping to: {mapping_filename}")
+        reverse_geocoding_performed = True
 
-    # Display the updated cluster information
-    if len(coordinates) > 0 and cluster:
+    # Display the updated cluster information only if reverse geocoding was performed successfully
+    if len(coordinates) > 0 and cluster and reverse_geocoding_performed:
         print("Cluster Centers (Updated):")
         for cluster_data in cluster:
             if len(cluster_data) == 6:  # Must have exactly 6 elements
@@ -1137,55 +1243,103 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
         print("No location data available, skipping location integration")
         return []
     
-    # Create a mapping from cluster ID to cluster data for faster lookup
-    cluster_id_to_data = {}
-    for cluster_data in cluster:
-        if len(cluster_data) == 6:  # Must have exactly 6 elements: cluster_id, lat, lon, num_points, place, distance_from_home
-            cluster_id = cluster_data[0]
-            cluster_id_to_data[cluster_id] = cluster_data
+    # Build a richer cluster_id_to_info map
+    cluster_id_to_info = {}
+    print("DEBUG: Processing cluster data:")
+    for cid, lat, lon, n_pts, raw_place, dist in cluster:
+        print(f"  Cluster {cid}: {raw_place[:100]}...")
+        # 1. split off a "home." prefix if present
+        is_home = raw_place.startswith("home. ")
+        if is_home:
+            rest = raw_place[len("home. "):]
+        else:
+            rest = raw_place
+        
+        # 2. split "rest" into the base_desc and the address
+        if ". Address: " in rest:
+            base_desc, address = rest.split(". Address: ", 1)
+            base_desc += "."  # re-append the period
+        else:
+            base_desc = rest
+            address = ""
+        
+        # 3. Determine label for sequence
+        if is_home:
+            # If it's home, use "Home" as the label
+            label = "Home"
+        else:
+            # Extract label for sequence: first landmark name, else first area name, else formatted address
+            label = "unknown"
+            landmark_name = None
+            area_name = None
+            
+            # Try to extract first landmark name
+            if "Landmarks:" in rest:
+                lm_section = rest.split("Landmarks: ")[1].split(". Address:")[0]
+                if "(" in lm_section:
+                    first_lm = lm_section.split("(")[0].strip()
+                    # Remove the relationship word (near, within, etc.)
+                    lm_parts = first_lm.split(" ")
+                    if len(lm_parts) > 1:
+                        landmark_name = " ".join(lm_parts[1:])
+                    else:
+                        landmark_name = first_lm
+            
+            # Try to extract first area name
+            if "Areas:" in rest:
+                ar_section = rest.split("Areas: ")[1].split(". Landmarks:")[0]
+                if "," in ar_section:
+                    area_name = ar_section.split(",")[0].strip()
+                else:
+                    area_name = ar_section.strip()
+                # Remove the relationship word
+                ar_parts = area_name.split(" ")
+                if len(ar_parts) > 1:
+                    area_name = " ".join(ar_parts[1:])
+            
+            if landmark_name:
+                label = landmark_name
+            elif area_name:
+                label = area_name
+            elif address:
+                # If no landmark or area found, use the formatted address
+                label = address
+        
+        cluster_id_to_info[cid] = {
+            "label": label,
+            "base_desc": base_desc,      # e.g. "Areas: ..., Landmarks: ..."
+            "address": address,          # e.g. "27 Wreckyn St, North Melbourne…"
+            "distance": dist
+        }
     
     # Convert points to a more usable format with timestamps
     location_records = []
     
-    for i in range(len(all_points)):
-        record_time = all_points[i][2]  # datetime string
-        label_now = cluster_labels[i]
-        
-        # Look up cluster data using the mapping
-        if label_now in cluster_id_to_data:
-            cluster_data = cluster_id_to_data[label_now]
-            place_now = cluster_data[4]  # place name
-            
-            # Use cluster's distance from home for all points in that cluster
-            if place_now == "home":
-                distance_from_home = 0
-            else:
-                # Get cluster distance from home
-                distance_from_home = cluster_data[5]  # cluster distance from home
-        else:
-            # Handle case where cluster ID is not found (shouldn't happen but defensive programming)
-            print(f"Warning: Cluster ID {label_now} not found in cluster data, using defaults")
-            place_now = "unknown"
-            distance_from_home = 0
-        
-        # Convert datetime string to timestamp for windowing
-        timestamp = convert_timestring_to_timestamp(record_time, CONFIG["timezone"])
-        
+    for i, pt in enumerate(all_points):
+        ts_str = pt[2]
+        cid = cluster_labels[i]
+        info = cluster_id_to_info.get(cid, {})
+        label = info.get("label", "unknown")
+
+        timestamp = convert_timestring_to_timestamp(ts_str, CONFIG["timezone"])
         location_records.append({
             'timestamp': timestamp,
-            'datetime': record_time,
-            'latitude': all_points[i][0],
-            'longitude': all_points[i][1],
-            'speed': all_points[i][3],
-            'cluster_id': label_now,
-            'place_name': place_now,
-            'distance_from_home': distance_from_home
+            'datetime': ts_str,
+            'latitude': pt[0],
+            'longitude': pt[1],
+            'speed': pt[3],
+            'cluster_id': cid,
+            'place_name': label,         # only the short label
+            'place_base_desc': info.get("base_desc", ""),
+            'place_address': info.get("address", ""),
+            'distance_from_home': info.get("distance", 0),
         })
     
     def process_location_window(window_data, datetime_str, window_start, window_end):
         """Process location data for a single time window."""
         if not window_data:
             return None
+        
         
         # Sort window data by timestamp
         sorted_data = sorted(window_data, key=lambda x: x['timestamp'])
@@ -1198,15 +1352,18 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
         # Use timestamp-based calculation for more accurate location stay times
         location_visits = calculate_location_stay_times_from_timestamps(sorted_data, window_start, window_end)
         
-        # Track location sequence for transitions
-        for i, record in enumerate(sorted_data):
-            place_name = record['place_name']
-            
-            # Track location sequence for transitions
-            if not location_sequence or location_sequence[-1] != place_name:
-                location_sequence.append(place_name)
-                if len(location_sequence) > 1:
-                    location_transitions += 1
+        # Build sequence using only the filtered locations (not raw data)
+        # First, get the set of valid location names that passed the threshold
+        valid_location_names = set(location_visits.keys())
+        
+        # Build sequence from raw data but only include valid locations
+        sequence_labels = []
+        for record in sorted_data:
+            lbl = record["place_name"]
+            # Only include locations that passed the threshold
+            if lbl in valid_location_names:
+                if not sequence_labels or sequence_labels[-1] != lbl:
+                    sequence_labels.append(lbl)
         
         # Generate description for this window
         description_parts = [f"{datetime_str} | locations | Location Analysis"]
@@ -1219,13 +1376,13 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
             description_parts.append(f"    - Visited {total_locations} locations")
         
         # Show location transitions
+        location_transitions = len(sequence_labels) - 1 if len(sequence_labels) > 1 else 0
         if location_transitions > 0:
             description_parts.append(f"    - Location transitions: {location_transitions}")
         
         # Show location sequence if there are multiple locations
-        if len(location_sequence) > 1:
-            # Simplify sequence by removing consecutive duplicates (already done above)
-            sequence_str = " → ".join(location_sequence)
+        if len(sequence_labels) > 1:
+            sequence_str = " → ".join(sequence_labels)
             description_parts.append(f"    - Location sequence: {sequence_str}")
         
         # Show detailed location information
@@ -1234,40 +1391,59 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
                                  key=lambda x: x[1]['estimated_time_seconds'], 
                                  reverse=True)
         
+        if not sorted_locations:
+            description_parts.append(f"    - No significant locations detected (insufficient data points)")
+            return '\n'.join(description_parts)
+        
         description_parts.append(f"    - Time spent at locations:")
         
-        for place_name, stats in sorted_locations:
-            # Format time spent
-            time_minutes = stats['estimated_time_minutes']
-            if time_minutes >= 60:
-                hours = int(time_minutes // 60)
-                minutes = int(time_minutes % 60)
-                if minutes > 0:
-                    time_str = f"{hours}h {minutes}m"
-                else:
-                    time_str = f"{hours}h"
-            elif time_minutes >= 1:
-                time_str = f"{int(time_minutes)}m"
+        for place_label, stats in sorted_locations:
+            # 1) bullet with label & time
+            total_seconds = stats["estimated_time_seconds"]
+            if total_seconds >= 3600:  # 1 hour
+                hrs = int(total_seconds // 3600)
+                mins = int((total_seconds % 3600) // 60)
+                time_str = f"{hrs}h {mins}m" if mins else f"{hrs}h"
+            elif total_seconds >= 60:
+                mins = int(total_seconds // 60)
+                secs = int(total_seconds % 60)
+                time_str = f"{mins}m {secs}s" if secs > 0 else f"{mins}m"
             else:
-                time_str = f"{int(stats['estimated_time_seconds'])}s"
+                time_str = f"{int(total_seconds)}s"
+
+            visits = stats.get("visit_count", 1)
+            visit_periods = stats.get('visit_periods', [])
             
-            # Format location description
-            if place_name == "home":
-                location_desc = "home"
+            # For single visits, show the time period inline
+            if visits == 1 and visit_periods:
+                period = visit_periods[0]
+                # Convert timestamps to datetime for display
+                start_dt = pd.to_datetime(period['start_time'], unit='ms', utc=True).tz_convert(timezone)
+                end_dt = pd.to_datetime(period['end_time'], unit='ms', utc=True).tz_convert(timezone)
+                start_time_str = start_dt.strftime('%H:%M:%S')
+                end_time_str = end_dt.strftime('%H:%M:%S')
+                suffix = f" ({start_time_str} - {end_time_str})"
             else:
-                if stats['distance_from_home'] > 0:
-                    location_desc = f"{place_name}, {stats['distance_from_home']:.1f}m from home"
-                else:
-                    location_desc = place_name
+                suffix = f" ({visits} visits)" if visits > 1 else ""
             
-            # Show revisit information if multiple visits
-            visit_count = stats.get('visit_count', 1)
-            if visit_count > 1:
-                description_parts.append(f"         - {location_desc}: {time_str} ({visit_count} visits)")
-            else:
-                description_parts.append(f"         - {location_desc}: {time_str}")
+            description_parts.append(f"         - {place_label}: {time_str}{suffix}")
+
+            # 2) now dump your saved human‐sentence and address
+            #    find the cluster_id for this label:
+            cid = next((cid for cid, info in cluster_id_to_info.items() if info["label"] == place_label), None)
+            if cid is not None:
+                info = cluster_id_to_info[cid]
+
+                # Show the same information for all clusters (home and non-home)
+                if info["base_desc"]:
+                    description_parts.append(f"              {info['base_desc']}")
+                if info["address"]:
+                    description_parts.append(f"              Address: {info['address']}")
+                # Show cluster distance from home (skip for Home location)
+                if info["distance"] > 0:
+                    description_parts.append(f"              Distance from home: {info['distance']:.1f}m")
             
-            # Show individual visit periods if there are multiple visits
+            # Show individual visit periods only for multiple visits
             visit_periods = stats.get('visit_periods', [])
             if len(visit_periods) > 1:
                 description_parts.append(f"              Visit periods:")
@@ -1279,7 +1455,7 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
                         if period_secs > 0:
                             period_time_str = f"{period_mins}m {period_secs}s"
                         else:
-                            period_time_str = f"{period_mins}m"
+                            period_time_str = f"{period_mins}m" # use min to avoid confusion with meters
                     else:
                         period_time_str = f"{int(period_duration)}s"
                     
@@ -1355,6 +1531,7 @@ def process_sensor_by_timewindow(sensor_data, sensor_name, start_timestamp, end_
             if current_window_start <= record['timestamp'] < current_window_end
         ]
         
+
         if not window_data:
             current_window_start = current_window_end
             continue
@@ -1647,8 +1824,16 @@ def describe_bluetooth_integrated(sensor_data, sensor_name, start_timestamp, end
             description_parts.append(f"    - Average named devices: {avg_named_devices:.1f} (range: {min_named_devices}-{max_named_devices}, from {gate_time_window}-min gate scans)")
         
         if averaged_devices:
-            description_parts.append(f"    - {len(averaged_devices)} named devices (by average detection frequency from {gate_time_window}-min gate scans):")
-            for device in averaged_devices:
+            # Limit to top 10 devices
+            top_devices = averaged_devices[:10]
+            total_devices = len(averaged_devices)
+            
+            if total_devices > 10:
+                description_parts.append(f"    - Top 10 of {total_devices} named devices (by average detection frequency from {gate_time_window}-min gate scans):")
+            else:
+                description_parts.append(f"    - {total_devices} named devices (by average detection frequency from {gate_time_window}-min gate scans):")
+            
+            for device in top_devices:
                 description_parts.append(
                     f"         - {device['display_name']} "
                     f"({device['avg_detections']:.1f} detections)"
@@ -3295,6 +3480,7 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
         tuple: (home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge)
     """
     daily_home_candidates = {}
+    days_without_nighttime = []
     
     print("\n=== Daily Home Candidate Analysis ===")
     
@@ -3339,7 +3525,8 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
             print(f"Day {day_id}: Home candidate cluster {day_home_candidate} at ({candidate_center[0]:.6f}, {candidate_center[1]:.6f})")
             print(f"  - {len(day_night_labels)} nighttime points, {np.sum(day_night_labels == day_home_candidate)} in candidate cluster")
         else:
-            print(f"Day {day_id}: No nighttime points found")
+            print(f"Day {day_id}: No nighttime points found - will check for home proximity after finding merged home")
+            days_without_nighttime.append(day_id)
     
     if not daily_home_candidates:
         raise ValueError("No daily home candidates found")
@@ -3407,11 +3594,36 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
     
     print(f"Clusters to merge: {sorted(list(clusters_to_merge))}")
     
-    # Step 5: Find the best representative cluster ID (most nighttime points)
+    # Step 5: Check days without nighttime points for clusters that could be merged to home
+    print("\n=== Checking Days Without Nighttime Points ===")
+    for day_id in days_without_nighttime:
+        day_data = daily_clusters[day_id]
+        day_labels = day_data['labels']
+        day_coordinates = day_data['coordinates']
+        
+        # Find all unique clusters for this day (excluding noise)
+        unique_clusters = set(label for label in day_labels if label != -1)
+        
+        for cluster_id in unique_clusters:
+            # Calculate center of this cluster
+            cluster_mask = np.array(day_labels) == cluster_id
+            cluster_coords = day_coordinates[cluster_mask]
+            cluster_center = np.mean(cluster_coords, axis=0)
+            
+            # Check distance to merged home center
+            distance_to_home = geodesic(cluster_center, merged_home_center).meters
+            
+            if distance_to_home <= merge_distance_threshold:
+                print(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - merging")
+                clusters_to_merge.add(cluster_id)
+            else:
+                print(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - not merging")
+    
+    # Step 6: Find the best representative cluster ID (most nighttime points)
     best_candidate = max(primary_group['candidates'], key=lambda c: c['nighttime_points_in_candidate'])
     home_cluster_index = best_candidate['cluster_id']
     
-    # Step 6: Analyze daily home presence
+    # Step 7: Analyze daily home presence
     daily_home_analysis = {}
     for day_id in daily_home_candidates.keys():
         if day_id in primary_group['days']:
@@ -3443,12 +3655,74 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
                     'nighttime_points': 0
                 }
     
+    # Also analyze days without nighttime points
+    for day_id in days_without_nighttime:
+        day_data = daily_clusters[day_id]
+        day_labels = day_data['labels']
+        day_coordinates = day_data['coordinates']
+        
+        # Find all unique clusters for this day (excluding noise)
+        unique_clusters = set(label for label in day_labels if label != -1)
+        
+        # Check if any cluster was merged to home
+        merged_clusters = [cluster_id for cluster_id in unique_clusters if cluster_id in clusters_to_merge]
+        
+        if merged_clusters:
+            # Find the cluster closest to home
+            closest_cluster = None
+            min_distance = float('inf')
+            
+            for cluster_id in merged_clusters:
+                cluster_mask = np.array(day_labels) == cluster_id
+                cluster_coords = day_coordinates[cluster_mask]
+                cluster_center = np.mean(cluster_coords, axis=0)
+                distance = geodesic(cluster_center, merged_home_center).meters
+                
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_cluster = cluster_id
+            
+            daily_home_analysis[day_id] = {
+                'was_home': True,
+                'home_cluster_id': closest_cluster,
+                'nighttime_points': 0,
+                'nighttime_points_at_home': 0,
+                'home_percentage': 0,
+                'merged_to_home': True,
+                'distance_from_home': min_distance
+            }
+        else:
+            # Find the closest cluster to home
+            closest_cluster = None
+            min_distance = float('inf')
+            
+            for cluster_id in unique_clusters:
+                cluster_mask = np.array(day_labels) == cluster_id
+                cluster_coords = day_coordinates[cluster_mask]
+                cluster_center = np.mean(cluster_coords, axis=0)
+                distance = geodesic(cluster_center, merged_home_center).meters
+                
+                if distance < min_distance:
+                    min_distance = distance
+                    closest_cluster = cluster_id
+            
+            daily_home_analysis[day_id] = {
+                'was_home': False,
+                'alternative_location': True,
+                'distance_from_home': min_distance,
+                'nighttime_points': 0,
+                'alternative_cluster_id': closest_cluster
+            }
+    
     # Print daily analysis
     print("\n=== Daily Home Presence Analysis ===")
     for day_id in sorted(daily_home_analysis.keys()):
         analysis = daily_home_analysis[day_id]
         if analysis['was_home']:
-            print(f"Day {day_id}: At home ({analysis['nighttime_points_at_home']}/{analysis['nighttime_points']} nighttime points, {analysis['home_percentage']:.1f}%)")
+            if analysis.get('merged_to_home', False):
+                print(f"Day {day_id}: At home (merged to home cluster, {analysis['distance_from_home']:.1f}m from home center)")
+            else:
+                print(f"Day {day_id}: At home ({analysis['nighttime_points_at_home']}/{analysis['nighttime_points']} nighttime points, {analysis['home_percentage']:.1f}%)")
         elif analysis.get('alternative_location', False):
             print(f"Day {day_id}: Away from home ({analysis['distance_from_home']:.1f}m from home, {analysis['nighttime_points']} nighttime points)")
         else:
@@ -3651,11 +3925,11 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
                 home_group_center = cluster_center  # Set for single-day clustering
                 print(f"Home cluster {cluster_id}: Using cluster center ({actual_center[0]:.6f}, {actual_center[1]:.6f})")
             
-            cluster.append((cluster_id, actual_center[0], actual_center[1], len(cluster_points), place))
+            cluster.append((int(cluster_id), float(actual_center[0]), float(actual_center[1]), int(len(cluster_points)), place))
         else:
             place = "unknown"
             # For non-home clusters, use the calculated cluster center
-            cluster.append((cluster_id, cluster_center[0], cluster_center[1], len(cluster_points), place))
+            cluster.append((int(cluster_id), float(cluster_center[0]), float(cluster_center[1]), int(len(cluster_points)), place))
 
     # Calculate distances of each cluster from home
     if home_group_center is None:
@@ -3671,7 +3945,7 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         else:
             # Calculate distance for non-home clusters
             distance_from_home = geodesic(home_group_center, (center_lat, center_lon)).meters
-        cluster[i] = cluster_entry + (distance_from_home,)  # Update the tuple in the cluster list
+        cluster[i] = cluster_entry + (float(distance_from_home),)  # Update the tuple in the cluster list
     
     # Validation: Show home cluster distance (should be 0 or very small)  
     for cluster_data in cluster:
@@ -3772,7 +4046,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
                     daily_datetimes.append(dt_str)
             
             if len(daily_coordinates) >= min_samples:
-                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M')} to {period_end.strftime('%Y-%m-%d %H:%M')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points")
+                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points")
                 
                 # Perform clustering for this day
                 daily_coordinates = np.array(daily_coordinates)
@@ -3818,7 +4092,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
                             all_cluster_labels.append(-1)
                         all_cluster_labels[global_idx] = adjusted_labels[i]
             else:
-                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M')} to {period_end.strftime('%Y-%m-%d %H:%M')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points (insufficient for clustering)")
+                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points (insufficient for clustering)")
             
             day_counter += 1
         
@@ -3931,27 +4205,82 @@ def calculate_location_stay_times_from_timestamps(sorted_data, window_start, win
         # Add to total time
         location_visits[location]['total_time_seconds'] += duration
     
-    # Convert to minutes and handle edge cases
+    # Identify locations that will be filtered out
+    locations_to_filter = set()
     for place_name, stats in location_visits.items():
+        # Filter based on minimum data points
+        if stats['data_points'] < location_minimum_data_points:
+            locations_to_filter.add(place_name)
+        # Also filter based on minimum stay duration
+        elif stats['total_time_seconds'] < (location_minimum_stay_minutes * 60):
+            locations_to_filter.add(place_name)
+    
+    # Merge periods for locations that will remain, accounting for filtered locations
+    if locations_to_filter:
+        #print(f"Will filter out locations: {', '.join(locations_to_filter)}") #Uncomment to see the locations that are being filtered out
+        
+        # For each location that will remain, merge its periods if there are filtered locations between them
+        for place_name, stats in location_visits.items():
+            if place_name not in locations_to_filter and len(stats['visit_periods']) > 1:
+                # Sort periods by start time
+                sorted_periods = sorted(stats['visit_periods'], key=lambda x: x['start_time'])
+                
+                # Merge all periods into one continuous period (since filtered locations are between them)
+                earliest_start = sorted_periods[0]['start_time']
+                latest_end = max(period['end_time'] for period in sorted_periods)
+                
+                # Create a single merged period
+                merged_period = {
+                    'start_time': earliest_start,
+                    'end_time': latest_end,
+                    'duration_seconds': (latest_end - earliest_start) / 1000.0
+                }
+                
+                # Update stats
+                stats['visit_periods'] = [merged_period]
+                stats['visit_count'] = 1  # Now it's one continuous visit
+                
+                # Recalculate total time from the merged period
+                total_time = merged_period['duration_seconds']
+                stats['total_time_seconds'] = total_time
+    
+    # Now filter out locations with insufficient data points
+    filtered_location_visits = {}
+    filtered_count = 0
+    for place_name, stats in location_visits.items():
+        if place_name not in locations_to_filter:
+            filtered_location_visits[place_name] = stats
+        else:
+            filtered_count += 1
+
+    #Uncomment to see the locations that are being filtered out
+            # if stats['data_points'] < location_minimum_data_points:
+            #     print(f"Filtering out location '{place_name}' with only {stats['data_points']} data points (threshold: {location_minimum_data_points})")
+            # elif stats['total_time_seconds'] < (location_minimum_stay_minutes * 60):
+            #     print(f"Filtering out location '{place_name}' with only {stats['total_time_seconds']:.1f}s stay time (minimum: {location_minimum_stay_minutes} minutes)")
+    
+    #Uncomment to see the number of locations that are being filtered out
+    # if filtered_count > 0:
+    #     print(f"Filtered out {filtered_count} locations with insufficient data points or stay time")
+    
+    # Convert to minutes for remaining locations and filter out data quality issues
+    final_location_visits = {}
+    for place_name, stats in filtered_location_visits.items():
         total_seconds = stats['total_time_seconds']
         
-        # Handle edge cases
+        # With multiple data points, we should always have a valid time span
+        # If total_seconds is 0, it indicates a data quality issue (same timestamps)
         if total_seconds <= 0:
-            # If no time calculated (single data point), estimate based on sampling interval
-            if len(sorted_data) > 1:
-                # Estimate average sampling interval
-                total_window_seconds = (window_end - window_start) / 1000.0
-                estimated_interval = total_window_seconds / len(sorted_data)
-                stats['estimated_time_seconds'] = estimated_interval * stats['data_points']
-            else:
-                # Single data point - assume 5 minutes minimum
-                stats['estimated_time_seconds'] = 300
+            print(f"Warning: Location '{place_name}' has {stats['data_points']} data points but zero time span - possible data quality issue")
+            print(f"  Visit periods: {stats.get('visit_periods', [])}")
+            print(f"  Skipping location due to zero time span")
+            continue
         else:
             stats['estimated_time_seconds'] = total_seconds
-        
-        stats['estimated_time_minutes'] = stats['estimated_time_seconds'] / 60.0
+            stats['estimated_time_minutes'] = total_seconds / 60.0
+            final_location_visits[place_name] = stats
     
-    return location_visits
+    return final_location_visits
 
 # Dictionary to store message traces and keep track of unique IDs
 message_traces = {}
@@ -4672,8 +5001,16 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
             description_parts.append(f"    - Average named networks: {avg_named_networks:.1f} (range: {min_named_networks}-{max_named_networks}, from {gate_time_window}-min gate scans)")
         
         if averaged_networks:
-            description_parts.append(f"    - {len(averaged_networks)} named networks (by average detection frequency from {gate_time_window}-min gate scans):")
-            for network in averaged_networks:
+            # Limit to top 10 networks
+            top_networks = averaged_networks[:10]
+            total_networks = len(averaged_networks)
+            
+            if total_networks > 10:
+                description_parts.append(f"    - Top 10 of {total_networks} named networks (by average detection frequency from {gate_time_window}-min gate scans):")
+            else:
+                description_parts.append(f"    - {total_networks} named networks (by average detection frequency from {gate_time_window}-min gate scans):")
+            
+            for network in top_networks:
                 description_parts.append(
                     f"         - {network['display_name']} "
                     f"({network['avg_detections']:.1f} detections)"
