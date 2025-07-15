@@ -1,3 +1,30 @@
+Todo:
+- Add screentext pipeline to Aware Narrator project and update its README.md
+
+2025-07-15
+- Update config.yaml
+    - Added merge_distance_threshold to set up threshold to merge home candidates during clustering. 
+    - Added input method to system_ui_apps:
+        -  com.google.android.inputmethod.latin         # Gboard
+- Updated aware_narrator
+    - Clean up code
+        - Remove count variable for app usage processing to keep only revisit_count
+        - Update comments related to home merge threshold
+    - Loading merge_distance_threshold from config.yaml.
+    - Fallback to simple app sequences based on foreground app records when session data is avaliable but emtpy app sequence.
+    - Update location clustering labels
+        - Different unknown places are assigned to unique labels (e.g., unknown1, unknown2)
+
+
+2025-07-14
+- Updated aware_narrator
+    - Improved system UI and blacklist filtering based on package name
+    - Fixed system UI filtering bugs
+    - Implemented centralied System UI filtering for application sensors: foreground, notification, and installation
+    - Implemented System UI filtering for screentext sensors
+    - Keyboard sensor does not apply system UI filering to avoid data loss (e.g., keyboard apps)
+
+
 2025-07-10
 - Manual setup:
     - Check updates on the github repo https://github.com/googlemaps/google-maps-services-python.git

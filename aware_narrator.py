@@ -70,11 +70,12 @@ min_samples = CONFIG["min_samples"]
 DISCARD_SYSTEM_UI = CONFIG["DISCARD_SYSTEM_UI"]
 night_time_start = CONFIG["night_time_start"]
 night_time_end = CONFIG["night_time_end"]
+merge_distance_threshold = CONFIG.get("merge_distance_threshold", 300)  # Distance threshold in meters to merge home candidates
 location_minimum_data_points = CONFIG.get("location_minimum_data_points", 3)  # Minimum location data points to display a location
 location_minimum_stay_minutes = CONFIG.get("location_minimum_stay_minutes", 5)  # Minimum stay duration to display a location
 
 blacklist_apps = CONFIG["blacklist_apps"]
-whitelist_system_apps = CONFIG["whitelist_system_apps"]
+system_ui_apps = CONFIG["system_ui_apps"]
 
 # Global variables for app processing
 application_name_list = {}
@@ -114,9 +115,6 @@ def process_participant(P_ID):
     
     # Initialize participant-specific variables
     sensor_narratives = {}
-    prev_battery_status = None
-    prev_keyboard = None
-    prev_sensor_wifi = None
     
     # Convert start and end times to timestamps
     START_TIMESTAMP = convert_timestring_to_timestamp(START_TIME, CONFIG["timezone"])
@@ -133,9 +131,6 @@ def process_participant(P_ID):
         sessions = load_session_data(default_session_file)
     
     print(f"Loaded {len(sessions)} session records")
-
-    # categorical key values to be converted to integers
-    key_list = ["battery_status", "battery_level", "call_type","call_duration", "installation_status", "message_type", "screen_status"]
 
     print("Keep data within time range: ", START_TIME, "to", END_TIME)
     
@@ -161,7 +156,7 @@ def process_participant(P_ID):
             continue
         
         # Handle WiFi and network sensors specially for combined processing
-        if sensor_name in ["wifi", "sensor_wifi", "network"]:
+        if sensor_name in ["wifi", "sensor_wifi"]:
             wifi_sensor_data[sensor_name] = sensor_data
             print(f"Collected {sensor_name} data: {len(sensor_data)} records")
             continue
@@ -173,12 +168,7 @@ def process_participant(P_ID):
         # Generate integrated descriptions for each sensor
         narratives = generate_integrated_description(sensor_data, sensor_name, START_TIMESTAMP, END_TIMESTAMP, sessions)
         if narratives:
-            # If it's a list of narratives (like from applications_foreground), extend the list
-            if isinstance(narratives, list):
-                sensor_narratives[sensor_name].extend(narratives)
-            else:
-                # For backward compatibility with single description sensors
-                sensor_narratives[sensor_name].append((sensor_name, narratives))
+            sensor_narratives[sensor_name].extend(narratives)
 
     # Process WiFi sensors together if we have any type
     if wifi_sensor_data:
@@ -402,36 +392,6 @@ def process_participant(P_ID):
                     distance_from_home
                 )
 
-                    
-                # # Process the reverse geocoding data
-                # reverse_geocode_results.append(reverse_geocode_data)
-                # data = reverse_geocode_data.get("results")[0] # get the most relevant result
-                # formatted_address = data.get("formatted_address", "")
-
-                # # Extract place information from address components
-                # place_type = ""
-                # place_name = ""
-                # for component in data.get("address_components", []):
-                #     if isinstance(component, dict) and component.get("types"):
-                #         types_list = component["types"]
-                #         if types_list and len(types_list) > 0:
-                #             place_type = types_list[0] or ""
-                #         place_name = component.get('long_name', '')
-                #         break
-
-                # # Combine strings with proper spacing, filtering out empty strings
-                # parts = [part for part in [place_type, place_name, formatted_address] if part.strip()]
-                # geocoded_place = ", ".join(parts)
-                
-                # # If this is the home cluster, keep "home" label and append geocoded result
-                # if place == "home":
-                #     updated_place = f"home, {geocoded_place}"
-                # else:
-                #     # For unknown places, replace with geocoded result
-                #     updated_place = geocoded_place
-
-                # # Update cluster data while preserving distance information
-                # cluster[idx] = (cluster_id, center_lat, center_lon, num_points, updated_place, distance_from_home)
         except Exception as e:
             print(f"Error in Google Maps API request: {e}")
         
@@ -518,11 +478,6 @@ def process_participant(P_ID):
     all_narratives = sort_narratives_by_time_window_and_sensor_order(unique_narratives)
     text = "\n".join([str(item[1]) for item in all_narratives])
 
-    # Remove system UI entries if required
-    if DISCARD_SYSTEM_UI:
-        cleaned_narrative_list = [x for x in all_narratives if "System UI" not in x[1]]
-        text = "\n".join([str(item[1]) for item in cleaned_narrative_list])
-        
     # Save to file
     with open(output_file, 'w', encoding='utf-8') as file:
         file.write(text)
@@ -587,6 +542,32 @@ def convert_timestamp_column(df, timezone_str="Australia/Melbourne"):
     
     return df
 
+def should_filter_system_ui_app(record, sensor_name):
+    """
+    Check if a record should be filtered out based on system UI app settings.
+    
+    This function centralizes the system UI filtering logic to avoid duplication
+    across different sensor processing functions. It checks:
+    1. If DISCARD_SYSTEM_UI is enabled in config
+    2. If the sensor is in the list of sensors that should be filtered
+    3. If the record has is_system_app = 1
+    4. If the package_name is in the system_ui_apps list
+    
+    Args:
+        record (dict): The sensor record to check
+        sensor_name (str): Name of the sensor
+        
+    Returns:
+        bool: True if the record should be filtered out, False otherwise
+    """
+    # Define sensors that should have System UI filtering applied
+    system_ui_filter_sensors = ['applications_foreground', 'applications_notifications', 'installations', 'screentext']
+    
+    return (DISCARD_SYSTEM_UI and 
+            sensor_name in system_ui_filter_sensors and 
+            record.get('is_system_app', 0) == 1 and
+            record.get('package_name') in system_ui_apps)
+
 def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
     """
     Load sensor data from JSONL file and filter by timestamp range.
@@ -623,6 +604,11 @@ def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
                     
                     # Check if timestamp is within range
                     if timestamp and start_timestamp <= timestamp <= end_timestamp:
+                        # Apply centralized System UI filtering for applications-related sensors
+                        # This prevents system UI apps like Edge panels from appearing in the data
+                        if should_filter_system_ui_app(record, sensor_name):
+                            continue
+                        
                         filtered_records.append(record)
                         
                 except json.JSONDecodeError as e:
@@ -642,6 +628,36 @@ def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
     print(f"Loaded {len(filtered_records)} records from {sensor_name} sensor")
     return filtered_records
 
+def _create_fallback_app_sequence(window_apps):
+    """
+    Helper function to create app sequence without session awareness.
+    Used as fallback when no sessions exist or session processing yields empty results.
+    """
+    app_sequence = []
+    for app in window_apps:
+        app_name = app.get('application_name', 'Unknown')
+        package_name = app.get('package_name', 'Unknown')
+        is_system_app = app.get('is_system_app', 0)
+        
+        # Apply blacklist filtering consistently
+        if any(package_name.lower() == blacklist_app.lower() for blacklist_app in blacklist_apps):
+            continue
+        
+        # Map package name to application name if available
+        if package_name in application_name_list:
+            app_name = application_name_list[package_name]
+        
+        app_sequence.append({
+            'app_name': app_name,
+            'timestamp': app['timestamp'],
+            'session_id': 'no_session'
+        })
+    
+    simplified_sequence = simplify_app_sequence_list(app_sequence)
+    switches = len(simplified_sequence) - 1 if len(simplified_sequence) > 1 else 0
+    revisit_counts = calculate_revisit_counts_from_sequence(simplified_sequence)
+    return simplified_sequence, switches, [{'session_id': 'no_session', 'sequence': simplified_sequence, 'switches': switches, 'is_fallback': True}], revisit_counts
+
 def calculate_session_aware_sequences_and_switches(window_apps, sessions, current_window_start, current_window_end):
     """
     Calculate app sequences, switches, and revisit counts respecting session boundaries.
@@ -655,116 +671,106 @@ def calculate_session_aware_sequences_and_switches(window_apps, sessions, curren
     Returns:
         tuple: (combined_sequence, total_switches, session_sequences, app_revisit_counts)
     """
-    if not sessions:
-        # Fallback to old behavior if no session data
-        app_sequence = []
-        for app in window_apps:
-            app_name = app.get('application_name', 'Unknown')
-            package_name = app.get('package_name', 'Unknown')
-            is_system_app = app.get('is_system_app', 0)
-            
-            # Map package name to application name if available
-            if package_name in application_name_list:
-                app_name = application_name_list[package_name]
-            
-            # Skip system apps if configured to discard
-            if DISCARD_SYSTEM_UI and is_system_app == 1:
-                continue
-                
-            app_sequence.append({
-                'app_name': app_name,
-                'timestamp': app['timestamp'],
-                'session_id': 'no_session'
-            })
-        
-        simplified_sequence = simplify_app_sequence_list(app_sequence)
-        switches = len(simplified_sequence) - 1 if len(simplified_sequence) > 1 else 0
-        revisit_counts = calculate_revisit_counts_from_sequence(simplified_sequence)
-        return simplified_sequence, switches, [{'session_id': 'no_session', 'sequence': simplified_sequence, 'switches': switches}], revisit_counts
-    
-    # Group apps by session active periods
-    session_app_sequences = {}
-    total_switches = 0
-    
-    # Create a mapping of apps to sessions based on active periods
-    for session in sessions:
-        if not (session['start_timestamp'] <= current_window_end and session['end_timestamp'] >= current_window_start):
-            continue
-            
-        session_id = session['session_id']
-        session_app_sequences[session_id] = []
-        
-        # For each active period in this session
-        for active_period in session['active_periods']:
-            period_start = max(active_period['start'], current_window_start)
-            period_end = min(active_period['end'], current_window_end)
-            
-            if period_start >= period_end:
-                continue
-                
-            # Find apps within this active period
-            period_apps = []
-            for app in window_apps:
-                if period_start <= app['timestamp'] < period_end:
-                    app_name = app.get('application_name', 'Unknown')
-                    package_name = app.get('package_name', 'Unknown')
-                    is_system_app = app.get('is_system_app', 0)
-                    
-                    # Map package name to application name if available
-                    if package_name in application_name_list:
-                        app_name = application_name_list[package_name]
-                    
-                    # Skip system apps if configured to discard
-                    if DISCARD_SYSTEM_UI and is_system_app == 1:
-                        continue
-                        
-                    period_apps.append({
-                        'app_name': app_name,
-                        'timestamp': app['timestamp'],
-                        'session_id': session_id
-                    })
-            
-            # Add period apps to session sequence
-            session_app_sequences[session_id].extend(period_apps)
-    
-    # Calculate simplified sequences, switches, and revisits per session
     session_sequences = []
     combined_sequence = []
-    total_revisit_counts = {}
     
-    for session_id, apps in session_app_sequences.items():
-        if not apps:
-            continue
+    # Try session-aware processing if sessions exist
+    if sessions:
+        # Group apps by session active periods
+        session_app_sequences = {}
+        total_switches = 0
+        
+        # Create a mapping of apps to sessions based on active periods
+        for session in sessions:
+            if not (session['start_timestamp'] <= current_window_end and session['end_timestamp'] >= current_window_start):
+                continue
+                
+            session_id = session['session_id']
+            session_app_sequences[session_id] = []
             
-        # Sort apps by timestamp within session
-        apps.sort(key=lambda x: x['timestamp'])
+            # For each active period in this session
+            for active_period in session['active_periods']:
+                period_start = max(active_period['start'], current_window_start)
+                period_end = min(active_period['end'], current_window_end)
+                
+                if period_start >= period_end:
+                    continue
+                    
+                # Find apps within this active period
+                period_apps = []
+                for app in window_apps:
+                    if period_start <= app['timestamp'] < period_end:
+                        app_name = app.get('application_name', 'Unknown')
+                        package_name = app.get('package_name', 'Unknown')
+                        is_system_app = app.get('is_system_app', 0)
+                        
+                        # Map package name to application name if available
+                        if package_name in application_name_list:
+                            app_name = application_name_list[package_name]
+                        
+                        period_apps.append({
+                            'app_name': app_name,
+                            'timestamp': app['timestamp'],
+                            'session_id': session_id
+                        })
+                
+                # Add period apps to session sequence
+                session_app_sequences[session_id].extend(period_apps)
         
-        # Simplify sequence within this session
-        simplified = simplify_app_sequence_list(apps)
-        switches = len(simplified) - 1 if len(simplified) > 1 else 0
+        # Calculate simplified sequences, switches, revisits, and durations per session
+        total_revisit_counts = {}
         
-        # Calculate revisits for this session
-        session_revisits = calculate_revisit_counts_from_sequence(simplified)
+        for session_id, apps in session_app_sequences.items():
+            if not apps:
+                continue
+                
+            # Sort apps by timestamp within session
+            apps.sort(key=lambda x: x['timestamp'])
+            
+            # Simplify sequence within this session
+            simplified = simplify_app_sequence_list(apps)
+            switches = len(simplified) - 1 if len(simplified) > 1 else 0
+            
+            # Calculate revisits for this session
+            session_revisits = calculate_revisit_counts_from_sequence(simplified)
+            
+            # Calculate session duration within this window
+            session_duration_seconds = 0
+            session_data = next((s for s in sessions if s['session_id'] == session_id), None)
+            if session_data:
+                # Calculate total active time for this session within the window
+                for active_period in session_data['active_periods']:
+                    period_start = max(active_period['start'], current_window_start)
+                    period_end = min(active_period['end'], current_window_end)
+                    
+                    if period_start < period_end:
+                        session_duration_seconds += (period_end - period_start) / 1000.0
+            
+            session_sequences.append({
+                'session_id': session_id,
+                'sequence': simplified,
+                'switches': switches,
+                'revisits': session_revisits,
+                'duration_seconds': session_duration_seconds
+            })
+            
+            total_switches += switches
+            
+            # Aggregate revisit counts across sessions
+            for app_name, revisit_count in session_revisits.items():
+                total_revisit_counts[app_name] = total_revisit_counts.get(app_name, 0) + revisit_count
+            
+            # Add session marker to combined sequence
+            if combined_sequence and simplified:
+                combined_sequence.append(f"[Session {session_id}]")
+            combined_sequence.extend(simplified)
         
-        session_sequences.append({
-            'session_id': session_id,
-            'sequence': simplified,
-            'switches': switches,
-            'revisits': session_revisits
-        })
-        
-        total_switches += switches
-        
-        # Aggregate revisit counts across sessions
-        for app_name, revisit_count in session_revisits.items():
-            total_revisit_counts[app_name] = total_revisit_counts.get(app_name, 0) + revisit_count
-        
-        # Add session marker to combined sequence
-        if combined_sequence and simplified:
-            combined_sequence.append(f"[Session {session_id}]")
-        combined_sequence.extend(simplified)
+        # If session processing was successful, return results
+        if session_sequences and combined_sequence:
+            return combined_sequence, total_switches, session_sequences, total_revisit_counts
     
-    return combined_sequence, total_switches, session_sequences, total_revisit_counts
+    # Fallback: no sessions or session processing resulted in empty sequences
+    return _create_fallback_app_sequence(window_apps)
 
 def simplify_app_sequence_list(app_sequence):
     """
@@ -817,7 +823,14 @@ def calculate_revisit_counts_from_sequence(simplified_sequence):
 
 def calculate_session_aware_app_durations(app_usage, sessions, current_window_start, current_window_end, total_active_seconds):
     """
-    Calculate app durations based on session active periods instead of raw timestamp spans.
+    Calculate actual app durations based on app foreground timestamps and session active periods.
+    
+    This function calculates the actual time each app was in the foreground during active periods
+    by analyzing the sequence of app foreground events and determining when each app started
+    and stopped being active within session boundaries.
+    
+    Includes all sessions that start within the current window and tracks app durations
+    that extend into subsequent windows.
     
     Args:
         app_usage: Dictionary of app usage statistics
@@ -827,63 +840,185 @@ def calculate_session_aware_app_durations(app_usage, sessions, current_window_st
         total_active_seconds: Total active time from sessions
         
     Returns:
-        dict: Updated app_usage with session-aware durations
+        dict: Updated app_usage with actual calculated durations and extension info
     """
     if not sessions or total_active_seconds <= 0:
         return app_usage
     
-    # Get all app timestamps within session active periods
-    session_app_usage = {}
-    total_app_events_in_sessions = 0
+    # Get all app foreground events within the window, sorted by timestamp
+    all_app_events = []
+    for app_name, stats in app_usage.items():
+        for timestamp in stats['timestamps']:
+            all_app_events.append({
+                'timestamp': timestamp,
+                'app_name': app_name,
+                'package_name': stats['package_name']
+            })
+    
+    # Sort all events by timestamp
+    all_app_events.sort(key=lambda x: x['timestamp'])
+    
+    # Initialize duration tracking for each app
+    app_durations = {app_name: 0.0 for app_name in app_usage.keys()}
+    app_extensions = {app_name: {'extends_into_next': False, 'extension_duration': 0.0} for app_name in app_usage.keys()}
+    
+    # Process each session that starts within the current window
+    for session in sessions:
+        # Include sessions that start within the window (regardless of where they end)
+        session_starts_in_window = current_window_start <= session['start_timestamp'] < current_window_end
+        
+        if not session_starts_in_window:
+            continue
+        
+        # Get events that fall within this session's active periods
+        session_events = []
+        for event in all_app_events:
+            for active_period in session['active_periods']:
+                if active_period['start'] <= event['timestamp'] < active_period['end']:
+                    session_events.append(event)
+                    break  # Found a matching active period for this event, move to next event
+        
+        if not session_events:
+            continue
+        
+        # Sort session events by timestamp
+        session_events.sort(key=lambda x: x['timestamp'])
+        
+        # Calculate actual usage durations for this session
+        current_app = None
+        current_app_start = None
+        
+        for i, event in enumerate(session_events):
+            # If this is a different app than the current one, end the previous app's duration
+            if current_app is not None and event['app_name'] != current_app:
+                # Calculate duration for the previous app
+                if current_app_start is not None:
+                    duration = (event['timestamp'] - current_app_start) / 1000.0  # Convert to seconds
+                    app_durations[current_app] += duration
+                
+                # Start tracking the new app
+                current_app = event['app_name']
+                current_app_start = event['timestamp']
+            elif current_app is None:
+                # First app in this session
+                current_app = event['app_name']
+                current_app_start = event['timestamp']
+            # If it's the same app, continue (no need to update start time)
+        
+        # Handle the last app in the session
+        if current_app is not None and current_app_start is not None:
+            # Find the end of the last active period for this session
+            last_active_end = None
+            for active_period in session['active_periods']:
+                period_start = max(active_period['start'], current_window_start)
+                period_end = min(active_period['end'], current_window_end)
+                if last_active_end is None or period_end > last_active_end:
+                    last_active_end = period_end
+            
+            if last_active_end is not None:
+                # Calculate duration within this window
+                window_duration = (last_active_end - current_app_start) / 1000.0  # Convert to seconds
+                app_durations[current_app] += window_duration
+                
+                # Check if this app extends into the next window
+                if last_active_end > current_window_end:
+                    app_extensions[current_app]['extends_into_next'] = True
+                    # Calculate extension duration (time beyond current window)
+                    extension_duration = (last_active_end - current_window_end) / 1000.0
+                    app_extensions[current_app]['extension_duration'] += extension_duration
+    
+    # Update app_usage with calculated durations and extension info, filtering out very short durations
+    filtered_app_usage = {}
     
     for app_name, stats in app_usage.items():
-        session_app_usage[app_name] = []
+        calculated_duration = app_durations.get(app_name, 0.0)
+        extension_info = app_extensions.get(app_name, {'extends_into_next': False, 'extension_duration': 0.0})
         
-        # Check each app timestamp against session active periods
-        for timestamp in stats['timestamps']:
-            for session in sessions:
-                if not (session['start_timestamp'] <= current_window_end and session['end_timestamp'] >= current_window_start):
-                    continue
-                    
-                # Check if timestamp falls within any active period of this session
-                for active_period in session['active_periods']:
-                    period_start = max(active_period['start'], current_window_start)
-                    period_end = min(active_period['end'], current_window_end)
-                    
-                    if period_start <= timestamp < period_end:
-                        session_app_usage[app_name].append(timestamp)
-                        total_app_events_in_sessions += 1
-                        break  # Found a matching active period, no need to check others
-                else:
-                    continue  # Only executed if inner loop wasn't broken
-                break  # Break outer session loop if we found a match
+        # Drop apps with very short durations (less than 1 second)
+        if calculated_duration < 1.0:
+            continue  # Skip this app entirely
+        
+        stats['duration_seconds'] = calculated_duration
+        stats['duration_minutes'] = calculated_duration / 60.0
+        stats['extends_into_next_window'] = extension_info['extends_into_next']
+        stats['extension_duration_seconds'] = extension_info['extension_duration']
+        stats['extension_duration_minutes'] = extension_info['extension_duration'] / 60.0
+        
+        filtered_app_usage[app_name] = stats
     
-    # Calculate durations based on proportional usage within sessions
-    if total_app_events_in_sessions > 0:
-        for app_name, stats in app_usage.items():
-            session_events = len(session_app_usage.get(app_name, []))
+    return filtered_app_usage
+
+def calculate_app_durations_from_sequence(window_apps, app_usage, current_window_start, current_window_end):
+    """
+    Calculate app durations from adjacent app foreground events when no session data is available.
+    
+    Args:
+        window_apps: List of app records in the time window (sorted by timestamp)
+        app_usage: Dictionary of app usage statistics to update
+        current_window_start: Window start timestamp
+        current_window_end: Window end timestamp
+        
+    Returns:
+        dict: Updated app_usage with calculated durations (only apps with calculable durations)
+    """
+    if not window_apps:
+        return {}
+    
+    # Sort window apps by timestamp to ensure proper sequence
+    sorted_apps = sorted(window_apps, key=lambda x: x['timestamp'])
+    
+    # Filter out blacklisted apps from the sequence
+    filtered_apps = []
+    for app in sorted_apps:
+        package_name = app.get('package_name', 'Unknown')
+        if not any(package_name.lower() == blacklist_app.lower() for blacklist_app in blacklist_apps):
+            filtered_apps.append(app)
+    
+    if not filtered_apps:
+        return {}
+    
+    # Calculate durations based on adjacent app events
+    filtered_app_usage = {}
+    
+    for i, app in enumerate(filtered_apps):
+        app_name = app.get('application_name', 'Unknown')
+        package_name = app.get('package_name', 'Unknown')
+        
+        # Map package name to application name if available
+        if package_name in application_name_list:
+            app_name = application_name_list[package_name]
+        
+        # Skip if this app was already filtered out from app_usage
+        if app_name not in app_usage:
+            continue
+        
+        # Calculate duration: time until next different app
+        duration_seconds = None
+        
+        # Look for the next different app
+        for j in range(i + 1, len(filtered_apps)):
+            next_app = filtered_apps[j]
+            next_app_name = next_app.get('application_name', 'Unknown')
+            next_package_name = next_app.get('package_name', 'Unknown')
             
-            if session_events > 0:
-                # Proportional allocation based on events within session active periods
-                proportion = session_events / total_app_events_in_sessions
-                estimated_duration = total_active_seconds * proportion
-                
-                # Apply minimum duration constraint
-                estimated_duration = max(estimated_duration, 60)  # At least 1 minute
-                
-                stats['duration_seconds'] = estimated_duration
-                stats['duration_minutes'] = estimated_duration / 60.0
-            else:
-                # App has no events within session active periods (edge case)
-                stats['duration_seconds'] = 60  # 1 minute default
-                stats['duration_minutes'] = 1.0
-    else:
-        # Fallback: all apps get equal minimal duration
-        for app_name, stats in app_usage.items():
-            stats['duration_seconds'] = 60  # 1 minute default
-            stats['duration_minutes'] = 1.0
+            # Map package name to application name if available
+            if next_package_name in application_name_list:
+                next_app_name = application_name_list[next_package_name]
+            
+            # If next app is different, calculate duration
+            if next_app_name != app_name:
+                duration_ms = next_app['timestamp'] - app['timestamp']
+                duration_seconds = duration_ms / 1000.0
+                break
+        
+        # Only include apps with calculable durations (not the last app or single apps)
+        if duration_seconds is not None and duration_seconds > 0:
+            # Update the existing app_usage entry with calculated duration
+            app_usage[app_name]['duration_seconds'] = duration_seconds
+            app_usage[app_name]['duration_minutes'] = duration_seconds / 60.0
+            filtered_app_usage[app_name] = app_usage[app_name]
     
-    return app_usage
+    return filtered_app_usage
 
 def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_minutes, start_timestamp, end_timestamp, sessions=None):
     """
@@ -948,24 +1083,17 @@ def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_
             if package_name in application_name_list:
                 app_name = application_name_list[package_name]
 
-            # Check if app is in blacklist (skip if found)
-            if any(app_name.lower() == app.lower() for app in blacklist_apps):
-                continue
-            
-            # Skip system apps if configured to discard. Exclude apps in a whitelist of system apps
-            if DISCARD_SYSTEM_UI and is_system_app == 1 and not any(app_name.lower() == app.lower() for app in whitelist_system_apps):
+            # Check if app is in blacklist (skip if found) - compare package names
+            if any(package_name.lower() == app.lower() for app in blacklist_apps):
                 continue
                 
             if app_name not in app_usage:
                 app_usage[app_name] = {
-                    'count': 0,
                     'first_seen': app['datetime'],
                     'last_seen': app['datetime'],
                     'package_name': package_name,
                     'timestamps': []
                 }
-            
-            app_usage[app_name]['count'] += 1
             app_usage[app_name]['last_seen'] = app['datetime']
             app_usage[app_name]['timestamps'].append(app['timestamp'])
 
@@ -989,42 +1117,35 @@ def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_
                 app_usage, sessions, current_window_start, current_window_end, total_window_duration
             )
         else:
-            # Fallback to old estimation method when no session data
-            for app_name, stats in app_usage.items():
-                timestamps = sorted(stats['timestamps'])
-                if len(timestamps) > 1:
-                    # Estimate duration based on time span and frequency
-                    time_span = timestamps[-1] - timestamps[0]
-                    # Assume each app usage represents some active time
-                    estimated_duration = min(time_span / 1000.0, time_window_minutes * 60)
-                    stats['duration_seconds'] = estimated_duration
-                    stats['duration_minutes'] = estimated_duration / 60.0
-                else:
-                    # Single usage - assume minimal duration
-                    stats['duration_seconds'] = 60  # 1 minute default
-                    stats['duration_minutes'] = 1.0
-                
-                # Add to total if we don't have session data
-                total_window_duration += stats['duration_seconds']
+            # Fallback method when no session data: calculate durations from adjacent app foreground events
+            app_usage = calculate_app_durations_from_sequence(
+                window_apps, app_usage, current_window_start, current_window_end
+            )
+            # Calculate total active time from calculable app durations only
+            total_window_duration = sum(stats.get('duration_seconds', 0) for stats in app_usage.values())
         
-        # Calculate percentages
+        # Calculate percentages only for apps with durations
         for app_name, stats in app_usage.items():
-            if total_window_duration > 0:
+            if 'duration_seconds' in stats and total_window_duration > 0:
                 stats['percentage'] = (stats['duration_seconds'] / total_window_duration) * 100
             else:
                 stats['percentage'] = 0
         
-        # Sort apps by usage duration
-        sorted_apps = sorted(app_usage.items(), key=lambda x: x[1]['duration_seconds'], reverse=True)
+        # Sort apps by usage duration (only apps with calculable durations)
+        sorted_apps = sorted(
+            [(app_name, stats) for app_name, stats in app_usage.items() if 'duration_seconds' in stats],
+            key=lambda x: x[1]['duration_seconds'], 
+            reverse=True
+        )
         
-        # Create summary for this time window
-        if sorted_apps:
+        # Create summary for this time window if there are any apps (even without durations)
+        if window_apps:  # Changed from sorted_apps to window_apps to always show sequence
             window_summary = {
                 'window_id': window_id,
                 'window_start': current_window_start,
                 'window_end': current_window_end,
                 'window_duration_minutes': time_window_minutes,
-                'total_apps': len(sorted_apps),
+                'total_apps': len(sorted_apps),  # Only count apps with calculable durations
                 'total_active_minutes': total_window_duration / 60.0,
                 'total_active_seconds': total_window_duration,
                 'app_sequence': combined_sequence,
@@ -1041,7 +1162,7 @@ def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_
                 # Use revisit count instead of raw count
                 revisit_count = app_revisit_counts.get(app_name, 0)
                 
-                window_summary['apps_used'].append({
+                app_info = {
                     'name': app_name,
                     'package_name': stats['package_name'],
                     'revisit_count': revisit_count,
@@ -1051,7 +1172,15 @@ def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_
                     'percentage': round(stats['percentage'], 1),
                     'first_seen': stats['first_seen'],
                     'last_seen': stats['last_seen']
-                })
+                }
+                
+                # Add extension information if available
+                if 'extends_into_next_window' in stats:
+                    app_info['extends_into_next_window'] = stats['extends_into_next_window']
+                    app_info['extension_duration_minutes'] = stats.get('extension_duration_minutes', 0)
+                    app_info['extension_duration_seconds'] = stats.get('extension_duration_seconds', 0)
+                
+                window_summary['apps_used'].append(app_info)
             
             summaries.append(window_summary)
         
@@ -1059,6 +1188,26 @@ def generate_app_usage_summary_by_timewindow(app_data, sensor_name, time_window_
         window_id += 1
     
     return summaries
+
+def format_duration_string(duration_seconds):
+    """
+    Format duration in seconds to human-readable string.
+    
+    Args:
+        duration_seconds (float): Duration in seconds
+        
+    Returns:
+        str: Formatted duration string
+    """
+    if duration_seconds >= 60:
+        duration_mins = int(duration_seconds // 60)
+        duration_secs = int(duration_seconds % 60)
+        if duration_secs > 0:
+            return f"{duration_mins} min {duration_secs} sec"
+        else:
+            return f"{duration_mins} min"
+    else:
+        return f"{int(duration_seconds)} sec"
 
 def format_app_usage_narratives(app_summaries):
     """
@@ -1095,7 +1244,13 @@ def format_app_usage_narratives(app_summaries):
         end_time_str = end_local_time.strftime('%H:%M')
         
         # Create narrative in the requested format
-        if total_apps == 0:
+        # Skip only if there are no apps with durations AND no app sequence to show
+        app_sequence = summary.get('app_sequence', [])
+        session_sequences = summary.get('session_sequences', [])
+        has_sequence = (app_sequence or 
+                       (session_sequences and any(s.get('sequence') for s in session_sequences)))
+        
+        if total_apps == 0 and not has_sequence:
             continue
         
         # Convert total active time to minutes and seconds
@@ -1134,7 +1289,13 @@ def format_app_usage_narratives(app_summaries):
                 session = session_sequences[0]
                 if session['sequence']:
                     sequence_str = " → ".join(session['sequence'])
-                    description_parts.append(f"    - App sequence: {sequence_str}")
+                    # Only show duration for real sessions, not fallback sequences
+                    if session.get('is_fallback', False):
+                        description_parts.append(f"    - App sequence: {sequence_str}")
+                    else:
+                        duration_seconds = session.get('duration_seconds', 0)
+                        duration_str = format_duration_string(duration_seconds)
+                        description_parts.append(f"    - App sequence: {sequence_str} ({duration_str})")
             else:
                 # Multiple sessions - show per-session sequences
                 description_parts.append(f"    - App sequences by session:")
@@ -1142,10 +1303,21 @@ def format_app_usage_narratives(app_summaries):
                     if session['sequence']:
                         sequence_str = " → ".join(session['sequence'])
                         switches = session['switches']
-                        if switches > 0:
-                            description_parts.append(f"         Session {session['session_id']}: {sequence_str} ({switches} switches)")
+                        
+                        # Only show duration for real sessions, not fallback sequences
+                        if session.get('is_fallback', False):
+                            if switches > 0:
+                                description_parts.append(f"         Session {session['session_id']}: {sequence_str} ({switches} switches)")
+                            else:
+                                description_parts.append(f"         Session {session['session_id']}: {sequence_str}")
                         else:
-                            description_parts.append(f"         Session {session['session_id']}: {sequence_str}")
+                            duration_seconds = session.get('duration_seconds', 0)
+                            duration_str = format_duration_string(duration_seconds)
+                            
+                            if switches > 0:
+                                description_parts.append(f"         Session {session['session_id']}: {sequence_str} ({switches} switches, {duration_str})")
+                            else:
+                                description_parts.append(f"         Session {session['session_id']}: {sequence_str} ({duration_str})")
         elif app_sequence:
             # Fallback for old format (no session data)
             sequence_str = " → ".join(app_sequence)
@@ -1167,11 +1339,17 @@ def format_app_usage_narratives(app_summaries):
             duration_secs = primary_app['duration_secs']
             percentage = primary_app['percentage']
             
-            revisit_count = primary_app.get('revisit_count', primary_app.get('count', 0))  # Backward compatibility
+            revisit_count = primary_app['revisit_count']
+            extension_info = ""
+            if primary_app.get('extends_into_next_window', False):
+                ext_mins = int(primary_app.get('extension_duration_minutes', 0))
+                ext_secs = int((primary_app.get('extension_duration_minutes', 0) - ext_mins) * 60)
+                extension_info = f" (extends {ext_mins} min {ext_secs} sec into next window)"
+            
             if revisit_count > 0:
-                description_parts.append(f"    - Primary: {primary_app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods; {revisit_count} revisits)")
+                description_parts.append(f"    - Primary: {primary_app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods; {revisit_count} revisits){extension_info}")
             else:
-                description_parts.append(f"    - Primary: {primary_app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods)")
+                description_parts.append(f"    - Primary: {primary_app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods){extension_info}")
             
             # Add secondary apps with detailed info
             if len(apps_used) > 1:
@@ -1180,11 +1358,17 @@ def format_app_usage_narratives(app_summaries):
                     duration_mins = app['duration_mins']
                     duration_secs = app['duration_secs']
                     percentage = app['percentage']
-                    revisit_count = app.get('revisit_count', app.get('count', 0))  # Backward compatibility
+                    revisit_count = app['revisit_count']
+                    extension_info = ""
+                    if app.get('extends_into_next_window', False):
+                        ext_mins = int(app.get('extension_duration_minutes', 0))
+                        ext_secs = int((app.get('extension_duration_minutes', 0) - ext_mins) * 60)
+                        extension_info = f" (extends {ext_mins} min {ext_secs} sec into next window)"
+                    
                     if revisit_count > 0:
-                        description_parts.append(f"         - {app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods; {revisit_count} revisits)")
+                        description_parts.append(f"         - {app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods; {revisit_count} revisits){extension_info}")
                     else:
-                        description_parts.append(f"         - {app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods)")
+                        description_parts.append(f"         - {app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods){extension_info}")
         
         description = '\n'.join(description_parts)
         narratives.append((datetime_str, description))
@@ -1268,34 +1452,42 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
             # If it's home, use "Home" as the label
             label = "Home"
         else:
-            # Extract label for sequence: first landmark name, else first area name, else formatted address
-            label = "unknown"
-            landmark_name = None
-            area_name = None
-            
-            # Try to extract first landmark name
-            if "Landmarks:" in rest:
-                lm_section = rest.split("Landmarks: ")[1].split(". Address:")[0]
-                if "(" in lm_section:
-                    first_lm = lm_section.split("(")[0].strip()
-                    # Remove the relationship word (near, within, etc.)
-                    lm_parts = first_lm.split(" ")
-                    if len(lm_parts) > 1:
-                        landmark_name = " ".join(lm_parts[1:])
+            # For non-home places, preserve unique unknown labels when reverse geocoding failed
+            # If raw_place starts with "unknown" followed by a number, it means reverse geocoding failed
+            # and we should preserve the unique unknown label
+            if raw_place.startswith("unknown") and raw_place[7:].isdigit():
+                label = raw_place  # Preserve unique unknown label (e.g., "unknown1", "unknown2")
+                landmark_name = None
+                area_name = None
+            else:
+                # Extract label for sequence: first landmark name, else first area name, else formatted address
+                label = "unknown"  # Default fallback
+                landmark_name = None
+                area_name = None
+                
+                                # Try to extract first landmark name
+                if "Landmarks:" in rest:
+                    lm_section = rest.split("Landmarks: ")[1].split(". Address:")[0]
+                    if "(" in lm_section:
+                        first_lm = lm_section.split("(")[0].strip()
+                        # Remove the relationship word (near, within, etc.)
+                        lm_parts = first_lm.split(" ")
+                        if len(lm_parts) > 1:
+                            landmark_name = " ".join(lm_parts[1:])
+                        else:
+                            landmark_name = first_lm
+                
+                # Try to extract first area name
+                if "Areas:" in rest:
+                    ar_section = rest.split("Areas: ")[1].split(". Landmarks:")[0]
+                    if "," in ar_section:
+                        area_name = ar_section.split(",")[0].strip()
                     else:
-                        landmark_name = first_lm
-            
-            # Try to extract first area name
-            if "Areas:" in rest:
-                ar_section = rest.split("Areas: ")[1].split(". Landmarks:")[0]
-                if "," in ar_section:
-                    area_name = ar_section.split(",")[0].strip()
-                else:
-                    area_name = ar_section.strip()
-                # Remove the relationship word
-                ar_parts = area_name.split(" ")
-                if len(ar_parts) > 1:
-                    area_name = " ".join(ar_parts[1:])
+                        area_name = ar_section.strip()
+                    # Remove the relationship word
+                    ar_parts = area_name.split(" ")
+                    if len(ar_parts) > 1:
+                        area_name = " ".join(ar_parts[1:])
             
             if landmark_name:
                 label = landmark_name
@@ -1357,13 +1549,24 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
         valid_location_names = set(location_visits.keys())
         
         # Build sequence from raw data but only include valid locations
+        # Apply display name conversion for sequence (same logic as for location display)
         sequence_labels = []
         for record in sorted_data:
             lbl = record["place_name"]
             # Only include locations that passed the threshold
             if lbl in valid_location_names:
-                if not sequence_labels or sequence_labels[-1] != lbl:
-                    sequence_labels.append(lbl)
+                # Apply same display name conversion as we do for location display
+                display_lbl = lbl
+                if lbl == "unknown":
+                    # Find cluster info to check if we should display as "home"
+                    cid = next((cid for cid, info in cluster_id_to_info.items() if info["label"] == lbl), None)
+                    if cid is not None:
+                        info = cluster_id_to_info[cid]
+                        if info["base_desc"] == "home":
+                            display_lbl = "home"
+                
+                if not sequence_labels or sequence_labels[-1] != display_lbl:
+                    sequence_labels.append(display_lbl)
         
         # Generate description for this window
         description_parts = [f"{datetime_str} | locations | Location Analysis"]
@@ -1386,10 +1589,9 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
             description_parts.append(f"    - Location sequence: {sequence_str}")
         
         # Show detailed location information
-        # Sort locations by estimated time spent (descending)
+        # Sort locations by chronological order (first occurrence time)
         sorted_locations = sorted(location_visits.items(), 
-                                 key=lambda x: x[1]['estimated_time_seconds'], 
-                                 reverse=True)
+                                 key=lambda x: x[1]['visit_periods'][0]['start_time'] if x[1]['visit_periods'] else 0)
         
         if not sorted_locations:
             description_parts.append(f"    - No significant locations detected (insufficient data points)")
@@ -1426,17 +1628,31 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
             else:
                 suffix = f" ({visits} visits)" if visits > 1 else ""
             
-            description_parts.append(f"         - {place_label}: {time_str}{suffix}")
-
-            # 2) now dump your saved human‐sentence and address
+            # For better readability, display "home" instead of "unknown" when appropriate
+            display_label = place_label
+            show_base_desc = True
+            
             #    find the cluster_id for this label:
             cid = next((cid for cid, info in cluster_id_to_info.items() if info["label"] == place_label), None)
             if cid is not None:
                 info = cluster_id_to_info[cid]
+                
+                # If label is "unknown" and description is simply "home", use "home" for better readability
+                if place_label == "unknown" and info["base_desc"] == "home":
+                    display_label = "Home"
+                    show_base_desc = False  # Don't repeat "home" below
+            
+            description_parts.append(f"         - {display_label}: {time_str}{suffix}")
 
-                # Show the same information for all clusters (home and non-home)
-                if info["base_desc"]:
-                    description_parts.append(f"              {info['base_desc']}")
+            # 2) now dump your saved human‐sentence and address
+            if cid is not None:
+                info = cluster_id_to_info[cid]
+
+                # Show the base description only if it provides meaningful additional information
+                if info["base_desc"] and show_base_desc:
+                    # Don't repeat the same label (e.g., don't show "unknown4" under "unknown4")
+                    if info["base_desc"] != display_label:
+                        description_parts.append(f"              {info['base_desc']}")
                 if info["address"]:
                     description_parts.append(f"              Address: {info['address']}")
                 # Show cluster distance from home (skip for Home location)
@@ -2554,7 +2770,7 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
         return chars_per_minute, words_per_minute, net_chars_per_minute
     
     def process_keyboard_window(window_data, datetime_str, window_start, window_end, sessions_data):
-        """Process keyboard data for a single time window with improved typing detection."""
+        """Process keyboard data for a single time window with typing detection."""
         if not window_data:
             return None
         
@@ -2579,8 +2795,8 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
             # Map package name to application name if available
             app_name = application_name_list.get(package_name, package_name)
 
-            #check if app is blacklisted
-            if any(app_name.lower() == app.lower() for app in blacklist_apps):
+            #check if app is blacklisted - compare package names
+            if any(package_name.lower() == app.lower() for app in blacklist_apps):
                 continue
             
             # Find matching session
@@ -3003,7 +3219,7 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_keyboard_window_with_sessions
     )
     
-    print(f"Generated {len(narratives)} keyboard narratives with improved typing detection (window size: {sensor_integration_time_window} minutes)")
+    print(f"Generated {len(narratives)} keyboard narratives with typing detection (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def sort_narratives_by_time_window_and_sensor_order(all_narratives):
@@ -3441,7 +3657,7 @@ IMPROVED MULTI-DAY HOME DETECTION APPROACH
 This implementation addresses the limitations of the original approach by:
 
 1. **Daily Home Candidate Identification**: For each day, identifies the most frequent nighttime cluster
-2. **Proximity-Based Merging**: Merges daily candidates that are within 50m of each other
+2. **Proximity-Based Merging**: Merges daily candidates that are within merge_distance_threshold of each other
 3. **Robust Home Detection**: Uses the merged location as the true home
 4. **Daily Analysis**: Provides insights into which days the user was actually home
 
@@ -3452,7 +3668,7 @@ Example scenario:
 - Day 4: User's home GPS reads (lat: -37.8135, lon: 144.9633) - Cluster 10
 
 Results:
-- Day 1, 2, 4 candidates are within 50m → merged as "home"
+- Day 1, 2, 4 candidates are within merge_distance_threshold → merged as "home"
 - Day 3 candidate is >500m away → identified as "away from home"
 - Final home location: weighted average of Days 1, 2, 4 coordinates
 
@@ -3474,7 +3690,7 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
         datetimes: All datetime strings
         night_time_start: Start hour of nighttime (e.g., 22 for 10 PM)
         night_time_end: End hour of nighttime (e.g., 6 for 6 AM)
-        merge_distance_threshold: Distance threshold in meters to merge candidates (default: 50m)
+        merge_distance_threshold: Distance threshold in meters to merge candidates
         
     Returns:
         tuple: (home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge)
@@ -3771,40 +3987,13 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         # Use daily home candidate merging approach
         home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge = identify_and_merge_daily_home_candidates(
             daily_clusters, clustered_coordinates, clustered_labels, clustered_datetimes,
-            night_time_start, night_time_end, merge_distance_threshold=50
+            night_time_start, night_time_end, merge_distance_threshold
         )
         
         # Store daily analysis for potential use in narratives
         globals()['daily_home_analysis'] = daily_home_analysis
         
-        # Step: Merge cluster labels for home candidates
-        if len(clusters_to_merge) > 1:
-            print(f"\n=== Merging Cluster Labels ===")
-            print(f"Merging clusters {sorted(list(clusters_to_merge))} into single home cluster")
-            
-            # Find the maximum cluster ID to create a new merged home cluster ID
-            max_cluster_id = max(clustered_labels) if len(clustered_labels) > 0 else 0
-            merged_home_cluster_id = max_cluster_id + 1
-            
-            # Update cluster labels: reassign all points from candidate clusters to merged home cluster
-            updated_labels = clustered_labels.copy()
-            merged_point_count = 0
-            
-            for cluster_id in clusters_to_merge:
-                cluster_mask = clustered_labels == cluster_id
-                merged_point_count += np.sum(cluster_mask)
-                updated_labels[cluster_mask] = merged_home_cluster_id
-                print(f"  - Reassigned {np.sum(cluster_mask)} points from cluster {cluster_id} to merged home cluster {merged_home_cluster_id}")
-            
-            # Update the clustered_labels with the new assignments
-            clustered_labels = updated_labels
-            home_cluster_index = merged_home_cluster_id
-            
-            print(f"Total points in merged home cluster: {merged_point_count}")
-            print(f"New home cluster ID: {merged_home_cluster_id}")
-        else:
-            print(f"Only one home cluster found ({home_cluster_index}), no merging needed")
-            merged_home_cluster_id = home_cluster_index
+        # Note: Merging and renumbering will be done together in the next step for efficiency
             
     else:
         # Use original method for single day or short periods
@@ -3842,78 +4031,106 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         home_group_center = None
         print("Will determine home center from home cluster centroid")
     
-    # RENUMBER CLUSTERS TO BE CONSECUTIVE (0, 1, 2, 3, ...)
-    # This ensures clean cluster IDs before reverse geocoding
-    print("\n=== Renumbering Clusters ===")
+    # COMBINED MERGING AND RENUMBERING IN SINGLE OPERATION
+    # This efficiently merges home candidates and assigns final consecutive IDs in one pass
+    print("\n=== Combined Merging and Renumbering Operation ===")
     unique_cluster_ids = sorted(set(clustered_labels))
     
-    if len(unique_cluster_ids) > 1:
-        # Create mapping from old cluster IDs to new consecutive IDs
-        old_to_new_mapping = {}
-        new_cluster_id = 0
+    # Create direct mapping from original cluster IDs to final consecutive IDs
+    old_to_new_mapping = {}
+    
+    if use_daily_clustering and daily_clusters and 'clusters_to_merge' in locals():
+        # Multi-day clustering: merge home candidates to ID 0, others get consecutive IDs
+        print(f"Merging home candidates {sorted(list(clusters_to_merge))} → ID 0")
         
+        # All home candidate clusters map to ID 0
+        for cluster_id in clusters_to_merge:
+            old_to_new_mapping[cluster_id] = 0
+            print(f"  - Home candidate cluster {cluster_id} → 0")
+        
+        # Assign consecutive IDs to non-home clusters
+        new_cluster_id = 1
         for old_cluster_id in unique_cluster_ids:
-            old_to_new_mapping[old_cluster_id] = new_cluster_id
-            print(f"  - Cluster {old_cluster_id} → {new_cluster_id}")
-            new_cluster_id += 1
+            if old_cluster_id not in clusters_to_merge:
+                old_to_new_mapping[old_cluster_id] = new_cluster_id
+                print(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}")
+                new_cluster_id += 1
         
-        # Apply the mapping to all cluster labels
-        renumbered_labels = clustered_labels.copy()
-        for i, old_id in enumerate(clustered_labels):
-            renumbered_labels[i] = old_to_new_mapping[old_id]
+        home_cluster_index = 0  # Merged home cluster is always ID 0
         
-        # Update cluster labels and home cluster index
-        clustered_labels = renumbered_labels
-        home_cluster_index = old_to_new_mapping[home_cluster_index]
-        
-        print(f"Renumbered {len(unique_cluster_ids)} clusters to consecutive IDs")
-        print(f"New home cluster ID: {home_cluster_index}")
-        
-        # Also update clusters_to_merge if it exists (for multi-day clustering)
-        if 'clusters_to_merge' in locals() and clusters_to_merge:
-            updated_clusters_to_merge = set()
-            for old_id in clusters_to_merge:
-                if old_id in old_to_new_mapping:
-                    updated_clusters_to_merge.add(old_to_new_mapping[old_id])
-            clusters_to_merge = updated_clusters_to_merge
     else:
-        print("Only one cluster found, no renumbering needed")
+        # Single-day clustering: home cluster to ID 0, others get consecutive IDs
+        print(f"Single home cluster {home_cluster_index} → ID 0")
+        
+        # Home cluster gets ID 0
+        old_to_new_mapping[home_cluster_index] = 0
+        print(f"  - Home cluster {home_cluster_index} → 0")
+        
+        # Assign consecutive IDs to other clusters
+        new_cluster_id = 1
+        for old_cluster_id in unique_cluster_ids:
+            if old_cluster_id != home_cluster_index:
+                old_to_new_mapping[old_cluster_id] = new_cluster_id
+                print(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}")
+                new_cluster_id += 1
+        
+        home_cluster_index = 0  # Home cluster is always ID 0
+    
+    # Apply the mapping in a single pass through all points
+    print(f"Applying final cluster assignments to {len(clustered_labels)} points...")
+    final_labels = clustered_labels.copy()
+    merged_point_count = 0
+    
+    for i, old_id in enumerate(clustered_labels):
+        final_labels[i] = old_to_new_mapping[old_id]
+        if old_to_new_mapping[old_id] == 0:  # Count points in merged home cluster
+            merged_point_count += 1
+    
+    # Update cluster labels with final assignments
+    clustered_labels = final_labels
+    
+    final_cluster_count = len(set(clustered_labels))
+    print(f"✓ Final result: {final_cluster_count} clusters (Home: {merged_point_count} points, Unknown: {len(clustered_labels) - merged_point_count} points)")
+    
+    # Set merged_home_center for distance calculations
+    if use_daily_clustering and daily_clusters and 'clusters_to_merge' in locals() and len(clusters_to_merge) > 1:
+        merged_home_center = merged_home_center  # Use the calculated merged center
+    else:
+        merged_home_center = None  # Will use cluster center
 
     """
-    CLUSTER DISTANCE CALCULATION FIX:
+    CLUSTER DISTANCE CALCULATION FIX WITH UNIQUE UNKNOWN PLACE LABELING:
     
-    Issue: In multi-day cases, after determining merged home center from daily candidates,
-    the cluster data structure wasn't properly updated to reflect this new home location.
+    Issue: All non-home clusters were labeled as "unknown", making them indistinguishable.
     
     Fix:
     1. Set home_group_center properly before cluster processing
-    2. For home cluster: Store merged home center coordinates (not cluster center)
-    3. For other clusters: Store original cluster center coordinates  
+    2. For home cluster: Use "home" label and store merged/cluster center coordinates
+    3. For other clusters: Use unique labels "unknown1", "unknown2", etc. based on their new IDs
     4. Calculate ALL distances using the same home_group_center reference point
     
     Result:
-    - Home cluster distance from home = ~0m (was >0m before)
-    - All other cluster distances are accurate relative to merged home center
-    - All points in a cluster use that cluster's distance from home
+    - Home cluster: labeled as "home", distance = 0m
+    - Other clusters: labeled as "unknown1", "unknown2", etc. with accurate distances
+    - Each unknown place gets a unique, meaningful identifier
     """
     
     cluster = []
-    for cluster_id in set(clustered_labels):
+    unknown_place_counter = 0
+    
+    # Process clusters in order of their final IDs to ensure consistent unknown numbering
+    for cluster_id in sorted(set(clustered_labels)):
         # Filter data by cluster ID, extract latitude and longitude for each cluster
         cluster_mask = clustered_labels == cluster_id
         cluster_points = clustered_coordinates[cluster_mask]  # Extract only latitude and longitude
-        # Skip if there is no data
+        
+        # Skip if there is no data (this handles merged clusters automatically)
         if len(cluster_points) == 0:
             continue
-        
-        # Skip old candidate clusters that were merged (only for multi-day clustering with actual merges)
-        if (use_daily_clustering and daily_clusters and 'clusters_to_merge' in locals() and 
-            len(clusters_to_merge) > 1 and cluster_id in clusters_to_merge and cluster_id != home_cluster_index):
-            print(f"Skipping old candidate cluster {cluster_id} (merged into home cluster {home_cluster_index})")
-            continue
             
-        cluster_center = np.mean(cluster_points, axis=0)  # Calculate the center of the cluster
-        if cluster_id == home_cluster_index:  # Determine if the cluster is the home cluster
+        cluster_center = np.mean(cluster_points, axis=0)
+        
+        if cluster_id == home_cluster_index:  # Home cluster (always ID 0)
             place = "home"
             # For home cluster, use merged home center if available, otherwise use cluster center
             if merged_home_center is not None:
@@ -3927,7 +4144,11 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
             
             cluster.append((int(cluster_id), float(actual_center[0]), float(actual_center[1]), int(len(cluster_points)), place))
         else:
-            place = "unknown"
+            # Generate unique unknown place labels: unknown1, unknown2, unknown3, etc.
+            unknown_place_counter += 1
+            place = f"unknown{unknown_place_counter}"
+            print(f"Unknown cluster {cluster_id}: Labeled as '{place}' at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f})")
+            
             # For non-home clusters, use the calculated cluster center
             cluster.append((int(cluster_id), float(cluster_center[0]), float(cluster_center[1]), int(len(cluster_points)), place))
 
@@ -4110,7 +4331,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
         
         # Apply DBSCAN clustering
         db = DBSCAN(
-            eps=eps,  # ~50m radius
+            eps=eps,  # radians (e.g., 0.000047 radians × 6371000 m ≈ 300m)
             min_samples=min_samples,  # require at least min_samples points to form a cluster
             metric='haversine'
         ).fit(coordinates_radians)
@@ -5725,21 +5946,24 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
         total_screen_time = 0
         
         for record in sorted_data:
+            package_name = record.get('package_name', 'Unknown')
             app_name = record.get('application_name', 'Unknown')
             duration = record.get('duration_seconds', 0)
             text = record.get('text', '')
-            is_system_app = record.get('is_system_app', False)
+            is_system_app = record.get('is_system_app', 0)
             start_datetime = record.get('start_datetime', '')
             end_datetime = record.get('end_datetime', '')
             active_period_id = record.get('active_period_id', '')
 
-            # Skip blacklisted apps
-            if any(app_name.lower() == app.lower() for app in blacklist_apps):
+            # Skip blacklisted apps - compare package names
+            if any(package_name.lower() == app.lower() for app in blacklist_apps):
                 continue
-            
-            # Uncomment to skip system apps excluding whitelisted apps
-            # if DISCARD_SYSTEM_UI and is_system_app == 1 and not any(app_name.lower() == app.lower() for app in whitelist_system_apps):
-            #     continue
+
+            # This is based on cleaned_input.jsonl, so we do not using centralized should_filter_system_ui_app function
+            if DISCARD_SYSTEM_UI and is_system_app == 1:
+                # Skip system UI apps - compare package names
+                if any(package_name.lower() == app.lower() for app in system_ui_apps):
+                    continue
             
             if not text.strip():
                 continue
