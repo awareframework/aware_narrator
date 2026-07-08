@@ -1,6 +1,7 @@
 import yaml
 import pytz
 import os
+import sys
 import pandas as pd
 from datetime import datetime, timedelta
 import json
@@ -10,6 +11,134 @@ from geopy.distance import geodesic
 import googlemaps
 from googlemaps import exceptions as gexceptions
 import re
+import logging
+import unicodedata
+from pathlib import Path
+import ftfy
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Unicode categories to strip: Cc (control), Cf (format, e.g. bidi overrides,
+# zero-width chars, soft hyphens).  We keep Zs (space separators) except for
+# non-breaking space (U+00A0) which is normalised to a regular space by ftfy.
+_STRIP_CATEGORIES = {'Cc', 'Cf'}
+
+
+def clean_text(text: str) -> str:
+    """Clean text by fixing encoding issues and removing invisible control characters."""
+    if not text:
+        return text
+    # Fix mojibake / encoding errors and normalise whitespace
+    text = ftfy.fix_text(text)
+    # Remove characters whose Unicode category is control or format
+    text = ''.join(ch for ch in text if unicodedata.category(ch) not in _STRIP_CATEGORIES or ch in '\n\r\t')
+    return text
+
+
+def _sanitize_unicode_recursive(obj):
+    """Recursively clean Unicode in all strings in a data structure."""
+    if isinstance(obj, str):
+        return clean_text(obj)
+    elif isinstance(obj, dict):
+        return {k: _sanitize_unicode_recursive(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_unicode_recursive(item) for item in obj]
+    return obj
+
+# Set up logging
+def setup_logging(pid=None, survey_id=None, console_level=logging.ERROR):
+    """
+    Set up logging to redirect detailed messages to log files while keeping only essential messages in console.
+    
+    Args:
+        pid (str, optional): Participant ID for log file naming
+        survey_id (str, optional): Survey ID for log file naming
+        console_level: Logging level for console output (default: ERROR for minimal output)
+    """
+    # Create logs directory
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    
+    # Get root logger
+    logger = logging.getLogger()
+    
+    # Always ensure main logging is set up (don't check if handlers exist)
+    main_log_file = log_dir / "processing.log"
+    
+    # Clear existing handlers to avoid duplicates
+    logger.handlers.clear()
+    
+    # Set up main logging manually since basicConfig won't work after handlers exist
+    logger.setLevel(logging.INFO)
+    
+    # Create formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    
+    # Main file handler for all messages
+    file_handler = logging.FileHandler(main_log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # Console handler for errors only (or specified level)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # If participant-specific logging is requested, ADD a participant-specific handler
+    # (don't remove the main handler)
+    if pid:
+        participant_log_dir = log_dir / pid
+        participant_log_dir.mkdir(exist_ok=True)
+        participant_log_file = participant_log_dir / f"processing_{pid}.log"
+        
+        # Check if we already have a handler for this participant file
+        existing_participant_handler = None
+        for handler in logger.handlers:
+            if (isinstance(handler, logging.FileHandler) and 
+                hasattr(handler, 'baseFilename') and 
+                str(participant_log_file) in handler.baseFilename):
+                existing_participant_handler = handler
+                break
+        
+        # If no existing handler for this participant, add one
+        if not existing_participant_handler:
+            participant_handler = logging.FileHandler(participant_log_file, mode='w', encoding='utf-8')
+            participant_handler.setLevel(logging.INFO)
+            participant_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            logger.addHandler(participant_handler)
+    
+    return logger
+
+def log_info(message, logger=None):
+    """Log info message to file only (not console)"""
+    if logger:
+        logger.info(message)
+    else:
+        logging.info(message)
+
+def log_warning(message, logger=None):
+    """Log warning message to both file and console"""
+    if logger:
+        logger.warning(message)
+    else:
+        logging.warning(message)
+
+def log_error(message, logger=None):
+    """Log error message to both file and console"""
+    if logger:
+        logger.error(message)
+    else:
+        logging.error(message)
+
+def log_summary(message, logger=None):
+    """Log summary message to both file and console (for high-level progress)"""
+    if logger:
+        logger.info(message)
+    else:
+        logging.info(message)
+    # Always print to console for summary information
+    print(message)
 
 # Load configuration from yaml file
 CONFIG_FILE = "./config.yaml"
@@ -18,53 +147,103 @@ with open(CONFIG_FILE, "r", encoding='utf-8') as file:
 
 # Assign variables from yaml
 pid_to_deviceid_map = CONFIG["pid_to_deviceid_map"]
+package_to_app_map = CONFIG["package_to_app_map"]
 
-# Load DEVICE_IDs from CSV file based on P_ID
-def load_device_ids_from_csv(csv_file_path, participant_id):
+# Device ID management functions
+# Global cache for device ID mappings
+_device_id_cache = None
+
+def load_all_device_ids_from_csv(csv_file_path):
     """
-    Load device IDs from CSV file for a given participant ID.
+    Load device IDs from CSV file for all participants at once.
     
     Args:
         csv_file_path (str): Path to the CSV file containing pid to device_id mapping
+        
+    Returns:
+        dict: Dictionary mapping participant IDs to lists of device IDs
+    """
+    global _device_id_cache
+    
+    if _device_id_cache is not None:
+        return _device_id_cache
+    
+    try:
+        df = pd.read_csv(csv_file_path)
+        device_mapping = {}
+        
+        for _, row in df.iterrows():
+            pid = row['pid']
+            device_id_str = row['device_id']
+            device_ids = [device_id.strip() for device_id in device_id_str.split(';')]
+            device_mapping[pid] = device_ids
+        
+        _device_id_cache = device_mapping
+        log_info(f"Loaded device IDs for {len(device_mapping)} participants from {csv_file_path}")
+        return device_mapping
+        
+    except FileNotFoundError:
+        log_warning(f"Error: CSV file {csv_file_path} not found")
+        return {}
+    except Exception as e:
+        log_error(f"Error reading CSV file {csv_file_path}: {e}")
+        return {}
+
+def get_device_ids_for_participant(participant_id, csv_file_path=None):
+    """
+    Convenient function to get device IDs for a participant using the global cache.
+    
+    Args:
         participant_id (str): Participant ID to lookup
+        csv_file_path (str, optional): Path to CSV file, uses config default if not provided
         
     Returns:
         list: List of device IDs for the participant
     """
-    try:
-        df = pd.read_csv(csv_file_path)
-        # Find the row for the given participant ID
-        participant_row = df[df['pid'] == participant_id]
-        
-        if participant_row.empty:
-            print(f"Warning: Participant ID '{participant_id}' not found in {csv_file_path}")
-            return []
-        
-        # Get the device_id value and split by semicolon
-        device_id_str = participant_row['device_id'].iloc[0]
-        device_ids = [device_id.strip() for device_id in device_id_str.split(';')]
-        
-        print(f"Loaded {len(device_ids)} device IDs for participant {participant_id}: {device_ids}")
-        return device_ids
-        
-    except FileNotFoundError:
-        print(f"Error: CSV file {csv_file_path} not found")
-        return []
-    except Exception as e:
-        print(f"Error reading CSV file {csv_file_path}: {e}")
-        return []
+    if csv_file_path is None:
+        csv_file_path = pid_to_deviceid_map
     
-# Get participant IDs from config
-P_IDs = CONFIG["P_IDs"]
+    all_device_mappings = load_all_device_ids_from_csv(csv_file_path)
+    return all_device_mappings.get(participant_id, [])
 
 # Global configuration variables
-START_TIME = CONFIG["START_TIME"]
-END_TIME = CONFIG["END_TIME"]
 timezone = pytz.timezone(CONFIG["timezone"])
 sensor_integration_time_window = CONFIG["sensor_integration_time_window"]
 gate_time_window = CONFIG["gate_time_window"]
 sensors = CONFIG["sensors"]
-GOOGLE_MAP_KEY = CONFIG["GOOGLE_MAP_KEY"]
+
+def load_google_maps_api_key(key_path):
+    """
+    Load Google Maps API key from a file path.
+    
+    Args:
+        key_path (str): Path to the file containing the API key
+        
+    Returns:
+        str: The API key, or None if file cannot be read
+    """
+    try:
+        with open(key_path, 'r') as file:
+            api_key = file.read().strip()
+            if api_key:
+                log_info(f"✓ Loaded Google Maps API key from {key_path}")
+                return api_key
+            else:
+                log_warning(f"⚠️ Google Maps API key file {key_path} is empty")
+                return None
+    except FileNotFoundError:
+        log_warning(f"⚠️ Google Maps API key file {key_path} not found")
+        return None
+    except Exception as e:
+        log_error(f"❌ Error reading Google Maps API key from {key_path}: {e}")
+        return None
+
+# Load Google Maps API key from file
+GOOGLE_MAP_KEY = load_google_maps_api_key(CONFIG["GOOGLE_MAP_KEY"])
+
+# Google Maps configuration
+USE_GOOGLE_MAP = CONFIG.get("USE_GOOGLE_MAP", False)
+
 eps = CONFIG["eps"]
 min_samples = CONFIG["min_samples"]
 DISCARD_SYSTEM_UI = CONFIG["DISCARD_SYSTEM_UI"]
@@ -78,123 +257,716 @@ blacklist_apps = CONFIG["blacklist_apps"]
 system_ui_apps = CONFIG["system_ui_apps"]
 
 # Global variables for app processing
-application_name_list = {}
+# Load app package name to application name mapping from resources folder at module import
+def _load_app_name_mapping_global():
+    """Load app package mapping into global variable at module import time."""
+    app_name_mapping = {}
+    try:
+        with open(package_to_app_map, 'r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if line:  # Skip empty lines
+                    app_data = json.loads(line)
+                    package_name = app_data.get("package_name")
+                    application_name = app_data.get("application_name")
+                    if package_name and application_name:
+                        app_name_mapping[package_name] = application_name
+        
+        if not app_name_mapping:
+            log_error(f"❌ ERROR: App package pairs file {package_to_app_map} exists but contains no valid mappings")
+            log_error("  Please ensure the file contains valid JSONL data with package_name and application_name fields")
+            sys.exit(1)
+        
+        log_info(f"✓ Loaded {len(app_name_mapping)} app package mappings globally")
+    except FileNotFoundError:
+        log_error(f"❌ ERROR: App package pairs file {package_to_app_map} not found")
+        log_error("  This file is required for processing. Please run generate_consolidated_app_package_pair.py first")
+        sys.exit(1)
+    except Exception as e:
+        log_error(f"❌ ERROR: Failed to read app package pairs file {package_to_app_map}: {e}")
+        sys.exit(1)
+    return app_name_mapping
 
-def process_participant(P_ID):
+# Load the mapping globally at module import
+application_name_list = _load_app_name_mapping_global()
+
+def parse_time_range_duration(time_range):
     """
-    Process sensor data for a single participant.
+    Parse time range string to duration in milliseconds.
     
     Args:
-        P_ID (str): Participant ID to process
+        time_range (str): Time range string like '7d', '24h', '3h', '1h'
         
+    Returns:
+        int: Duration in milliseconds
+    """
+    if time_range.endswith('w'):
+        # Week
+        weeks = int(time_range[:-1])
+        return weeks * 7 * 24 * 60 * 60 * 1000
+    elif time_range.endswith('d'):
+        # Day
+        days = int(time_range[:-1])
+        return days * 24 * 60 * 60 * 1000
+    elif time_range.endswith('h'):
+        # Hour
+        hours = int(time_range[:-1])
+        return hours * 60 * 60 * 1000
+    else:
+        raise ValueError(f"Unsupported time range format: {time_range}")
+
+def expand_time_ranges(start, end):
+    """
+    Generate a list of time range strings from start to end (inclusive).
+    Both must use the same unit (h, d, or w). Steps by 1 in that unit.
+    Order follows start→end (ascending if start < end, descending if start > end).
+
+    Args:
+        start (str): Start time range (e.g., '1d')
+        end (str): End time range (e.g., '119d')
+
+    Returns:
+        list: List of time range strings (e.g., ['1d', '2d', ..., '119d'])
+    """
+    start_unit = start[-1]
+    end_unit = end[-1]
+    if start_unit != end_unit:
+        raise ValueError(
+            f"time_range_start ('{start}') and time_range_end ('{end}') must use the same unit. "
+            f"Got '{start_unit}' and '{end_unit}'."
+        )
+    if start_unit not in ('h', 'd', 'w'):
+        raise ValueError(f"Unsupported time range unit: '{start_unit}'. Must be 'h', 'd', or 'w'.")
+
+    start_val = int(start[:-1])
+    end_val = int(end[:-1])
+    step = 1 if start_val <= end_val else -1
+    return [f"{v}{start_unit}" for v in range(start_val, end_val + step, step)]
+
+def load_survey_time_data(survey_time_file):
+    """
+    Load survey time data from CSV file.
+    
+    Args:
+        survey_time_file (str): Path to the survey time CSV file
+        
+    Returns:
+        pandas.DataFrame: Survey time data with columns: pid, survey_id, survey_time_unix
+    """
+    try:
+        df = pd.read_csv(survey_time_file)
+        log_info(f"Loaded {len(df)} survey time records from {survey_time_file}")
+        return df
+    except FileNotFoundError:
+        log_warning(f"Error: Survey time file {survey_time_file} not found")
+        return pd.DataFrame()
+    except Exception as e:
+        log_error(f"Error reading survey time file {survey_time_file}: {e}")
+        return pd.DataFrame()
+
+
+
+def _process_single_participant_auto(pid, surveys, time_ranges, direction, config):
+    """
+    Process all surveys for a single participant in auto mode.
+    Designed to be called either sequentially or in a ProcessPoolExecutor.
+
+    Args:
+        pid (str): Participant ID
+        surveys (list): List of survey dicts with 'survey_id' and 'survey_time_unix'
+        time_ranges (list): Time ranges to generate
+        direction (str): "backward" or "forward"
+        config (dict): Full CONFIG dictionary (passed explicitly for subprocess safety)
+
+    Returns:
+        tuple: (pid, participant_result, processed_surveys, skipped_surveys)
+    """
+    participant_logger = setup_logging(pid)
+
+    log_summary(f"\n{'='*50}")
+    log_summary(f"STARTING participant: {pid}")
+    log_summary(f"{'='*50}")
+    log_summary(f"Surveys to process: {[s['survey_id'] for s in surveys]}")
+
+    log_info(f"\n{'='*50}")
+    log_info(f"Processing participant: {pid}")
+    log_info(f"{'='*50}")
+    log_info(f"Surveys to process: {[s['survey_id'] for s in surveys]}")
+
+    participant_output_dir = config["output_dir"].format(P_ID=pid)
+    os.makedirs(participant_output_dir, exist_ok=True)
+
+    participant_result = {
+        'total_surveys': len(surveys),
+        'processed_surveys': 0,
+        'skipped_surveys': 0,
+        'survey_details': [],
+        'time_ranges_generated': set(),
+        'total_files_created': 0
+    }
+
+    processed_surveys = 0
+    skipped_surveys = 0
+
+    for survey in surveys:
+        survey_id = survey['survey_id']
+        survey_time_unix = survey['survey_time_unix']
+
+        survey_dt = pd.to_datetime(survey_time_unix, unit='ms', utc=True).tz_convert(config["timezone"])
+
+        if config.get("align_to_midnight", False):
+            original_time = survey_dt.strftime('%Y-%m-%d %H:%M:%S')
+            midnight_dt = survey_dt.normalize()
+            survey_time_unix = int(midnight_dt.value // 1_000_000)
+            survey_dt = midnight_dt
+            log_info(f"    Aligned survey time from {original_time} to midnight: {survey_dt.strftime('%Y-%m-%d %H:%M:%S')}", participant_logger)
+
+        if config.get("skip_survey_day", False):
+            if direction == "forward":
+                original_time = survey_dt.strftime('%Y-%m-%d %H:%M:%S')
+                next_day_dt = survey_dt.normalize() + pd.Timedelta(days=1)
+                survey_time_unix = int(next_day_dt.value // 1_000_000)
+                survey_dt = next_day_dt
+                log_info(f"    Skipped survey day: adjusted start from {original_time} to {survey_dt.strftime('%Y-%m-%d %H:%M:%S')}", participant_logger)
+            elif not config.get("align_to_midnight", False):
+                original_time = survey_dt.strftime('%Y-%m-%d %H:%M:%S')
+                midnight_dt = survey_dt.normalize()
+                survey_time_unix = int(midnight_dt.value // 1_000_000)
+                survey_dt = midnight_dt
+                log_info(f"    Skipped survey day: adjusted end from {original_time} to {survey_dt.strftime('%Y-%m-%d %H:%M:%S')}", participant_logger)
+
+        log_summary(f"  Processing {survey_id} (survey time: {survey_dt.strftime('%Y-%m-%d %H:%M:%S')})")
+        log_info(f"  Processing {survey_id} (survey time: {survey_dt.strftime('%Y-%m-%d %H:%M:%S')})", participant_logger)
+
+        survey_result = {
+            'survey_id': survey_id,
+            'survey_date': survey_dt.strftime('%Y-%m-%d'),
+            'status': 'failed',
+            'time_ranges': {},
+            'files_created': 0
+        }
+
+        try:
+            daily_output_dir = config["daily_output_dir"].format(P_ID=pid)
+
+            log_info(f"    Generating all time ranges directly for survey {survey_id} ({direction})...", participant_logger)
+
+            time_range_descriptions, daily_descriptions, time_range_windows, daily_windows = process_participant_auto(
+                pid, survey_time_unix, time_ranges, daily_output_dir, direction, participant_logger
+            )
+
+            if not time_range_descriptions:
+                log_warning(f"      ⚠️  Failed to generate any time ranges - skipping survey", participant_logger)
+                skipped_surveys += 1
+                participant_result['skipped_surveys'] += 1
+                survey_result['status'] = 'processing_failed'
+                participant_result['survey_details'].append(survey_result)
+                continue
+
+            result_files = {}
+            for time_range, description in time_range_descriptions.items():
+                if description.strip():
+                    range_output_dir = f"{participant_output_dir}/{time_range}"
+                    os.makedirs(range_output_dir, exist_ok=True)
+
+                    output_file = f"{range_output_dir}/{pid}_{survey_id}_{time_range}_output.txt"
+                    with open(output_file, 'w', encoding='utf-8') as f:
+                        f.write(clean_text(description))
+
+                    json_file = generate_json_output(
+                        time_range_windows[time_range], pid, survey_id, time_range, range_output_dir
+                    )
+
+                    if json_file:
+                        log_info(f"        ✓ Generated JSON: {os.path.basename(json_file)}", participant_logger)
+
+                    window_count = description.count("Window ")
+                    result_files[time_range] = (output_file, window_count)
+
+            for day_date, day_content in daily_descriptions.items():
+                daily_file = os.path.join(daily_output_dir, f"day_{day_date}.txt")
+                with open(daily_file, 'w', encoding='utf-8') as f:
+                    f.write(clean_text(day_content))
+
+                if day_date in daily_windows and daily_windows[day_date]:
+                    daily_json = generate_json_output(
+                        daily_windows[day_date], pid, output_dir=daily_output_dir,
+                        filename=f"day_{day_date}.json"
+                    )
+                    if daily_json:
+                        log_info(f"        ✓ Generated daily JSON: day_{day_date}.json", participant_logger)
+
+            if not result_files:
+                log_warning(f"      ⚠️  Warning: No time ranges generated for {survey_id} - skipping survey", participant_logger)
+                skipped_surveys += 1
+                participant_result['skipped_surveys'] += 1
+                survey_result['status'] = 'no_time_ranges'
+                participant_result['survey_details'].append(survey_result)
+                continue
+
+            window_counts = {time_range: window_count for time_range, (_, window_count) in result_files.items()}
+
+            if all(count == 0 for count in window_counts.values()):
+                log_warning(f"      ⚠️  Warning: All time ranges for {survey_id} have zero windows - skipping survey", participant_logger)
+                skipped_surveys += 1
+                participant_result['skipped_surveys'] += 1
+                survey_result['status'] = 'zero_windows'
+                participant_result['survey_details'].append(survey_result)
+                continue
+
+            window_count_groups = {}
+            for time_range, window_count in window_counts.items():
+                if window_count not in window_count_groups:
+                    window_count_groups[window_count] = []
+                window_count_groups[window_count].append(time_range)
+
+            removed_ranges = []
+            for window_count, ranges_with_same_count in window_count_groups.items():
+                if len(ranges_with_same_count) > 1:
+                    ranges_with_same_count.sort(key=parse_time_range_duration)
+
+                    kept_range = ranges_with_same_count[0]
+
+                    for time_range in ranges_with_same_count[1:]:
+                        output_file, _ = result_files[time_range]
+                        if os.path.exists(output_file):
+                            os.remove(output_file)
+                            json_file = output_file.replace('_output.txt', '.json')
+                            if os.path.exists(json_file):
+                                os.remove(json_file)
+                            output_dir = os.path.dirname(output_file)
+                            if os.path.isdir(output_dir) and not os.listdir(output_dir):
+                                os.rmdir(output_dir)
+                            removed_ranges.append(time_range)
+
+            files_created = 0
+            for time_range, (output_file, window_count) in result_files.items():
+                if time_range not in removed_ranges:
+                    survey_result['time_ranges'][time_range] = window_count
+                    participant_result['time_ranges_generated'].add(time_range)
+                    files_created += 1
+                    log_info(f"        ✓ {time_range}: {window_count} windows", participant_logger)
+                else:
+                    log_info(f"        - {time_range}: {window_count} windows (removed - duplicate content)", participant_logger)
+
+            survey_result['files_created'] = files_created
+            survey_result['status'] = 'success'
+            participant_result['total_files_created'] += files_created
+            participant_result['processed_surveys'] += 1
+            processed_surveys += 1
+
+        except Exception as e:
+            log_warning(f"    ⚠️  Warning: Failed to process {survey_id}: {e} - skipping survey", participant_logger)
+            skipped_surveys += 1
+            participant_result['skipped_surveys'] += 1
+            survey_result['status'] = f'exception: {str(e)}'
+
+        participant_result['survey_details'].append(survey_result)
+
+    log_info(f"  ✓ Completed participant {pid}", participant_logger)
+
+    log_summary(f"FINISHED participant: {pid}")
+    log_summary(f"{'='*50}")
+
+    # Clean up empty participant directories if no files were created
+    if participant_result['total_files_created'] == 0:
+        if os.path.isdir(participant_output_dir):
+            for subdir in os.listdir(participant_output_dir):
+                subdir_path = os.path.join(participant_output_dir, subdir)
+                if os.path.isdir(subdir_path) and not os.listdir(subdir_path):
+                    os.rmdir(subdir_path)
+            if not os.listdir(participant_output_dir):
+                os.rmdir(participant_output_dir)
+                log_info(f"  Removed empty output directory for {pid}", participant_logger)
+
+        daily_output_dir = config["daily_output_dir"].format(P_ID=pid)
+        if os.path.isdir(daily_output_dir) and not os.listdir(daily_output_dir):
+            os.rmdir(daily_output_dir)
+            log_info(f"  Removed empty daily output directory for {pid}", participant_logger)
+
+    return (pid, participant_result, processed_surveys, skipped_surveys)
+
+
+def process_auto_mode():
+    """
+    Optimized auto mode processing - processes each survey time range individually to avoid loading unnecessary data.
+    
     Returns:
         bool: True if processing was successful, False otherwise
     """
-    print(f"\n{'='*60}")
-    print(f"Processing participant: {P_ID}")
-    print(f"{'='*60}")
+    # Set up logging for auto mode
+    logger = setup_logging()
     
-    # Load device IDs for this participant
-    DEVICE_IDs = load_device_ids_from_csv(pid_to_deviceid_map, P_ID)
-    if not DEVICE_IDs:
-        print(f"Warning: No device IDs found for participant {P_ID}. Skipping.")
+    log_info(f"\n{'='*60}")
+    log_info("PROCESSING IN AUTO MODE")
+    log_info(f"{'='*60}")
+    
+    # Load survey time data
+    survey_time_file = CONFIG["survey_time_file"]
+    survey_df = load_survey_time_data(survey_time_file)
+    
+    if survey_df.empty:
+        log_warning("No survey time data available. Skipping auto mode processing.")
         return False
     
-    # Set up participant-specific paths
-    input_directory = CONFIG["input_directory"].format(P_ID=P_ID)
-    output_file = CONFIG["output_file"].format(P_ID=P_ID)
-    daily_output_dir = CONFIG["daily_output_dir"].format(P_ID=P_ID)
-    reverse_geocoding_output_dir = CONFIG["reverse_geocoding_output_dir"].format(P_ID=P_ID)
+    # Get time ranges and direction from config
+    # Support either explicit list (time_ranges) or start/end shorthand (time_range_start + time_range_end)
+    if "time_range_start" in CONFIG and "time_range_end" in CONFIG:
+        time_ranges = expand_time_ranges(CONFIG["time_range_start"], CONFIG["time_range_end"])
+        log_info(f"Expanded time_range_start='{CONFIG['time_range_start']}' to time_range_end='{CONFIG['time_range_end']}' → {len(time_ranges)} ranges")
+    elif "time_ranges" in CONFIG:
+        time_ranges = CONFIG["time_ranges"]
+    else:
+        log_error("Config must specify either 'time_ranges' or both 'time_range_start' and 'time_range_end'.")
+        return False
+    direction = CONFIG.get("direction", "backward")  # Default to backward for compatibility
+    log_info(f"Time ranges to process: {time_ranges}")
+    log_info(f"Direction: {direction}")
     
-    # Ensure output directories exist
+    # Group surveys by participant for efficient processing
+    participant_surveys = {}
+    for _, survey_row in survey_df.iterrows():
+        pid = survey_row['pid']
+        survey_id = survey_row['survey_id']
+        survey_time_unix = int(survey_row['survey_time_unix'])
+        
+        if pid not in participant_surveys:
+            participant_surveys[pid] = []
+        participant_surveys[pid].append({
+            'survey_id': survey_id,
+            'survey_time_unix': survey_time_unix
+        })
+    
+    log_info(f"Found {len(participant_surveys)} unique participants")
+    for pid, surveys in participant_surveys.items():
+        # Show survey times in local timezone for better readability
+        survey_info = []
+        for s in surveys:
+            survey_dt = pd.to_datetime(s['survey_time_unix'], unit='ms', utc=True).tz_convert(CONFIG["timezone"])
+            survey_info.append(f"{s['survey_id']}({survey_dt.strftime('%m-%d')})")
+        log_info(f"  {pid}: {len(surveys)} surveys ({', '.join(survey_info)})")
+    
+    processed_participants = 0
+    processed_surveys = 0
+    skipped_surveys = 0
+
+    # Collect participant-level results for summary
+    participant_results = {}
+
+    # Process each participant's surveys individually by time range
+    num_workers = CONFIG.get("num_workers", 1)
+
+    if num_workers > 1:
+        log_summary(f"Processing {len(participant_surveys)} participants in parallel (num_workers={num_workers})")
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_single_participant_auto, pid, surveys, time_ranges, direction, CONFIG
+                ): pid
+                for pid, surveys in participant_surveys.items()
+            }
+            for future in as_completed(futures):
+                pid = futures[future]
+                try:
+                    result_pid, result_data, p_processed, p_skipped = future.result()
+                    participant_results[result_pid] = result_data
+                    processed_participants += 1
+                    processed_surveys += p_processed
+                    skipped_surveys += p_skipped
+                except Exception as e:
+                    log_error(f"Participant {pid} failed with exception: {e}")
+                    participant_results[pid] = {
+                        'total_surveys': len(participant_surveys[pid]),
+                        'processed_surveys': 0,
+                        'skipped_surveys': len(participant_surveys[pid]),
+                        'survey_details': [],
+                        'time_ranges_generated': set(),
+                        'total_files_created': 0
+                    }
+                    skipped_surveys += len(participant_surveys[pid])
+    else:
+        for pid, surveys in participant_surveys.items():
+            result_pid, result_data, p_processed, p_skipped = _process_single_participant_auto(
+                pid, surveys, time_ranges, direction, CONFIG
+            )
+            participant_results[result_pid] = result_data
+            processed_participants += 1
+            processed_surveys += p_processed
+            skipped_surveys += p_skipped
+
+    # Participant-focused summary - prepare content for both print and file
+    summary_lines = []
+    summary_lines.append("="*60)
+    summary_lines.append("AUTO MODE PROCESSING SUMMARY BY PARTICIPANT")
+    summary_lines.append("="*60)
+    
+    for pid, results in participant_results.items():
+        summary_lines.append(f"\n{pid}:")
+        summary_lines.append(f"  Total surveys: {results['total_surveys']}")
+        summary_lines.append(f"  Successfully processed: {results['processed_surveys']}")
+        summary_lines.append(f"  Skipped/failed: {results['skipped_surveys']}")
+        summary_lines.append(f"  Time ranges generated: {', '.join(sorted(results['time_ranges_generated']))}")
+        summary_lines.append(f"  Total output files: {results['total_files_created']}")
+        
+        # Show survey details
+        successful_surveys = [s for s in results['survey_details'] if s['status'] == 'success']
+        if successful_surveys:
+            summary_lines.append(f"  Successful surveys:")
+            for survey in successful_surveys:
+                time_range_info = ', '.join([f"{tr}({count}w)" for tr, count in survey['time_ranges'].items()])
+                summary_lines.append(f"    ✓ {survey['survey_id']} ({survey['survey_date']}): {time_range_info}")
+        
+        failed_surveys = [s for s in results['survey_details'] if s['status'] != 'success']
+        if failed_surveys:
+            summary_lines.append(f"  Failed surveys:")
+            for survey in failed_surveys:
+                summary_lines.append(f"    ✗ {survey['survey_id']} ({survey['survey_date']}): {survey['status']}")
+    
+    summary_lines.append(f"\n{'='*60}")
+    summary_lines.append("OVERALL SUMMARY")
+    summary_lines.append("="*60)
+    summary_lines.append(f"Total participants: {len(participant_surveys)}")
+    summary_lines.append(f"Participants processed: {processed_participants}")
+    summary_lines.append(f"Total surveys processed: {processed_surveys}")
+    summary_lines.append(f"Total surveys skipped: {skipped_surveys}")
+    summary_lines.append(f"Directory structure: description/{{P_ID}}/{{time_range}}/{{P_ID}}_{{survey_id}}_{{time_range}}_output.txt")
+    summary_lines.append(f"JSON output: description/{{P_ID}}/{{time_range}}/{{P_ID}}_{{survey_id}}_{{time_range}}.json")
+    summary_lines.append(f"Optimization applied: Only smallest time range kept for duplicate window counts")
+    
+    # Print summary to console (keep this visible)
+    log_summary(f"\n{chr(10).join(summary_lines)}")
+    
+    # Also log the summary
+    log_info(f"\n{chr(10).join(summary_lines)}", logger)
+    
+    # Save summary to file
+    try:
+        # Use the base output directory (without P_ID formatting)
+        base_output_dir = CONFIG["output_dir"].replace("/{P_ID}", "")
+        summary_file = os.path.join(base_output_dir, "processing_summary.txt")
+        os.makedirs(base_output_dir, exist_ok=True)
+        
+        # Add timestamp to the summary
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write(f"Processing completed at: {timestamp}\n")
+            f.write(f"Survey time file: {CONFIG['survey_time_file']}\n")
+            if "time_range_start" in CONFIG and "time_range_end" in CONFIG:
+                f.write(f"Time ranges: {CONFIG['time_range_start']} to {CONFIG['time_range_end']}\n\n")
+            else:
+                f.write(f"Time ranges: {CONFIG.get('time_ranges', [])}\n\n")
+            f.write('\n'.join(summary_lines))
+        
+        log_info(f"\n✓ Summary saved to: {summary_file}", logger)
+        
+    except Exception as e:
+        log_warning(f"\n⚠️  Warning: Could not save summary to file: {e}", logger)
+    
+    return processed_participants > 0
+
+def process_participant_auto(pid, survey_time_unix, time_ranges, daily_output_dir, direction="backward", logger=None):
+    """
+    Process participant data for auto mode and generate all time ranges directly.
+    This function handles sensor data processing and generates auto mode outputs with multiple time ranges.
+
+    Args:
+        pid (str): Participant ID to process
+        survey_time_unix (int): Reference time in unix milliseconds
+        time_ranges (list): List of time ranges to generate (e.g., ['7d', '3d', '24h'])
+        daily_output_dir (str): Daily output directory
+        direction (str): "backward" (survey_time is END) or "forward" (survey_time is START)
+        logger: Logger instance for detailed logging
+
+    Returns:
+        tuple: (time_range_descriptions, daily_descriptions, time_range_windows, daily_windows)
+               time_range_descriptions: dict mapping time_range -> description text
+               daily_descriptions: dict mapping day -> description text
+               time_range_windows: dict mapping time_range -> list of window data
+               daily_windows: dict mapping day -> list of window data dicts
+    """
+    from collections import defaultdict
+
+    # Calculate the longest time range to determine data loading boundaries
+    longest_range_duration_ms = max(parse_time_range_duration(tr) for tr in time_ranges)
+
+    # Calculate start/end timestamps based on direction
+    if direction == "forward":
+        # Forward: survey_time is START, load data until survey_time + longest_range
+        start_timestamp = survey_time_unix
+        end_timestamp = survey_time_unix + longest_range_duration_ms
+    else:
+        # Backward (default): survey_time is END, load data from survey_time - longest_range
+        start_timestamp = survey_time_unix - longest_range_duration_ms
+        end_timestamp = survey_time_unix
+
+    log_info(f"Loading data for direct generation ({direction}) from {start_timestamp} to {end_timestamp}", logger)
+    
+    # Set up directories
     os.makedirs(daily_output_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    os.makedirs(reverse_geocoding_output_dir, exist_ok=True)
     
-    jsonl_files = [(f"{sensor}.jsonl", sensor) for sensor in sensors]
+    # Load sensor data (similar to process_participant_manual_core but with direct generation)
+    input_directory = CONFIG["input_directory"].format(P_ID=pid)
     
-    # Initialize participant-specific variables
-    sensor_narratives = {}
+    # Load JSON files based on sensors defined in config
+    sensors = CONFIG.get("sensors", [])
+    jsonl_files = []
+    for sensor in sensors:
+        jsonl_file_path = os.path.join(input_directory, f"{sensor}.jsonl")
+        jsonl_files.append((jsonl_file_path, sensor))
     
-    # Convert start and end times to timestamps
-    START_TIMESTAMP = convert_timestring_to_timestamp(START_TIME, CONFIG["timezone"])
-    END_TIMESTAMP = convert_timestring_to_timestamp(END_TIME, CONFIG["timezone"])
-
-    # Load session data for accurate active time calculation
-    session_file_path = CONFIG.get("session_data_file", "").format(P_ID=P_ID)
-    sessions = load_session_data(session_file_path)
-    
-    # If config session file not found, try the default location
+    # Load session data
+    session_file_path = CONFIG.get("session_file", f"step1_data/{pid}/sessions.jsonl")
+    sessions = load_session_data(session_file_path, logger)
     if not sessions:
-        default_session_file = f"step1_data/{P_ID}/sessions.jsonl"
-        print(f"Trying default session file location: {default_session_file}")
-        sessions = load_session_data(default_session_file)
+        default_session_file = f"step1_data/{pid}/sessions.jsonl"
+        sessions = load_session_data(default_session_file, logger)
     
-    print(f"Loaded {len(sessions)} session records")
-
-    print("Keep data within time range: ", START_TIME, "to", END_TIME)
-    
-    #store location data in a list
+    # Collect all narratives
+    all_narratives = []
     location_data = []
-    
-    # Store WiFi sensor data separately for combined processing
     wifi_sensor_data = {}
-
-    for jsonl_file, sensor_name in jsonl_files:      
-        sensor_data = get_sensor_data(sensor_name, START_TIMESTAMP, END_TIMESTAMP, input_directory)
-        #If sensor_data is not found, skip the sensor
+    
+    for jsonl_file, sensor_name in jsonl_files:
+        sensor_data = get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_directory, logger)
         if not sensor_data:
             continue
-
+            
         # Convert to DataFrame for timestamp processing, then back to list of dictionaries
         df = pd.DataFrame(sensor_data)
         df = convert_timestamp_column(df, CONFIG["timezone"])
         sensor_data = df.to_dict('records')
-
+        
         if sensor_name == "locations":
             location_data = sensor_data
             continue
-        
-        # Handle WiFi and network sensors specially for combined processing
+            
+        # Handle WiFi sensors specially for combined processing
         if sensor_name in ["wifi", "sensor_wifi"]:
             wifi_sensor_data[sensor_name] = sensor_data
-            print(f"Collected {sensor_name} data: {len(sensor_data)} records")
             continue
-        
-        # Initialize sensor-specific narrative list
-        if sensor_name not in sensor_narratives:
-            sensor_narratives[sensor_name] = []
-
+            
         # Generate integrated descriptions for each sensor
-        narratives = generate_integrated_description(sensor_data, sensor_name, START_TIMESTAMP, END_TIMESTAMP, sessions)
+        narratives = generate_integrated_description(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions, pid)
         if narratives:
-            sensor_narratives[sensor_name].extend(narratives)
-
-    # Process WiFi sensors together if we have any type
+            all_narratives.extend(narratives)
+    
+    # Process WiFi sensors together
     if wifi_sensor_data:
         sensor_wifi_data = wifi_sensor_data.get("sensor_wifi", [])
         wifi_data = wifi_sensor_data.get("wifi", [])
-        
-        print(f"Processing combined WiFi analysis:")
-        print(f"  - sensor_wifi: {len(sensor_wifi_data)} records")
-        print(f"  - wifi: {len(wifi_data)} records")
-        
-        # Generate combined WiFi narratives
         combined_wifi_narratives = generate_wifi_combined_description(
-            sensor_wifi_data, wifi_data, START_TIMESTAMP, END_TIMESTAMP, sessions
+            sensor_wifi_data, wifi_data, start_timestamp, end_timestamp, sessions
         )
-        
         if combined_wifi_narratives:
-            # Store combined WiFi narratives under a unified key
-            sensor_narratives["wifi_combined"] = combined_wifi_narratives
-            print(f"Generated {len(combined_wifi_narratives)} combined WiFi narratives")
+            all_narratives.extend(combined_wifi_narratives)
+    
+    # Process locations with clustering (using the same logic as manual mode)
+    if location_data:
+        log_info(f"Processing location data with clustering for auto mode...", logger)
+        location_narratives = process_location_data_with_clustering(
+            location_data, start_timestamp, end_timestamp, sessions, pid, logger
+        )
+        if location_narratives:
+            all_narratives.extend(location_narratives)
+            log_info(f"Added {len(location_narratives)} location narratives to auto mode output", logger)
+    
+    # Use the new direct generation function
+    time_range_descriptions, daily_descriptions, time_range_windows, daily_windows = generate_all_outputs_auto(
+        all_narratives, survey_time_unix, time_ranges, CONFIG["timezone"], direction
+    )
 
-    #summary len of each sensor narrative list
-    for sensor_name, narrative_list in sensor_narratives.items():
-        print(f"Sensor: {sensor_name}, Number of integrated descriptions: {len(narrative_list)}")
+    log_info(f"Generated {len(time_range_descriptions)} time ranges and {len(daily_descriptions)} daily files ({direction})", logger)
 
+    return time_range_descriptions, daily_descriptions, time_range_windows, daily_windows
+
+
+def process_participant_manual(pid):
+    """
+    Process sensor data for a single participant in manual mode.
+    Uses CONFIG values for all parameters.
+    
+    Args:
+        pid (str): Participant ID to process
+        
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    log_summary(f"\n{'='*60}")
+    log_summary(f"Processing participant: {pid} (MANUAL MODE)")
+    log_summary(f"{'='*60}")
+    
+    # Set up participant-specific logging (same as auto mode)
+    participant_logger = setup_logging(pid)
+    
+    participant_start_time = CONFIG["START_TIME"]
+    participant_end_time = CONFIG["END_TIME"]
+    output_file = CONFIG["output_file"].format(
+        P_ID=pid,
+        START_TIME=CONFIG["START_TIME"].replace(" ", "_").replace(":", "-"),
+        END_TIME=CONFIG["END_TIME"].replace(" ", "_").replace(":", "-")
+    )
+    daily_output_dir = CONFIG["daily_output_dir"].format(P_ID=pid)
+    
+    log_info(f"Manual mode: Using CONFIG time range: {participant_start_time} to {participant_end_time}", participant_logger)
+    log_info(f"Manual mode: Using CONFIG output paths", participant_logger)
+    
+    return process_participant_manual_core(pid, participant_start_time, participant_end_time, output_file, daily_output_dir, participant_logger)
+
+def load_app_name_mapping():
+    """
+    Load app package name to application name mapping from resources folder.
+    
+    NOTE: The mapping is now loaded globally at module import time in application_name_list.
+    This function is kept for backward compatibility and testing purposes.
+    
+    PARALLEL PROCESSING SAFE: This function does not modify global state.
+    
+    Returns:
+        dict: Package name to application name mapping
+    """
+    app_package_file_path = package_to_app_map
+    app_name_mapping = {}
+    
+    try:
+        with open(app_package_file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                line = line.strip()
+                if line:  # Skip empty lines
+                    app_data = json.loads(line)
+                    package_name = app_data.get("package_name")
+                    application_name = app_data.get("application_name")
+                    if package_name and application_name:
+                        app_name_mapping[package_name] = application_name
+        log_info(f"Loaded {len(app_name_mapping)} app package mappings")
+    except FileNotFoundError:
+        log_warning(f"Warning: App package pairs file {app_package_file_path} not found")
+        app_name_mapping = {}
+    except Exception as e:
+        log_error(f"Error reading app package pairs file: {e}")
+        app_name_mapping = {}
+    
+    return app_name_mapping
+
+def process_location_data_with_clustering(location_data, start_timestamp, end_timestamp, sessions, pid, logger=None):
+    """
+    Process location data through clustering and reverse geocoding.
+    Extracted from manual mode to be reused in auto mode.
+    
+    Args:
+        location_data: Raw location sensor data
+        start_timestamp: Start timestamp in milliseconds
+        end_timestamp: End timestamp in milliseconds
+        sessions: Session data
+        pid: Participant ID
+        logger: Logger instance
+        
+    Returns:
+        list: Location narrative dictionaries
+    """
     # Generate distance matrix from location_data
-    print("Locations: Generate distance matrix...")
+    log_info("Locations: Generate distance matrix...", logger)
     
     # Build points with original indices to maintain alignment
     points_with_indices = []
@@ -210,59 +982,52 @@ def process_participant(P_ID):
             ))
     
     if not points_with_indices:
-        print("No valid location points found! Skipping location processing.")
-        # Initialize empty variables for location processing
-        indices = []
-        coordinates = np.array([])
-        datetimes = []
-        speeds = []
-        cluster = []
-        cluster_labels = np.array([])
-        daily_clusters = {}
-    else:
-        # Extract data for clustering (only coordinates)
-        indices = [item[0] for item in points_with_indices]
-        coordinates = np.array([[item[1], item[2]] for item in points_with_indices])  # Only lat, lon
-        datetimes = [item[3] for item in points_with_indices]
-        speeds = [item[4] for item in points_with_indices]
+        log_warning("No valid location points found! Skipping location processing.", logger)
+        return []
+    
+    # Extract data for clustering (only coordinates)
+    indices = [item[0] for item in points_with_indices]
+    coordinates = np.array([[item[1], item[2]] for item in points_with_indices])  # Only lat, lon
+    datetimes = [item[3] for item in points_with_indices]
+    speeds = [item[4] for item in points_with_indices]
     
     # Only proceed with clustering if we have coordinates to process
     if len(coordinates) > 0:
-        print(f"Data size is {len(coordinates)}")
+        log_info(f"Data size is {len(coordinates)}", logger)
         # Determine if we should use daily clustering or all data
-        start_dt = datetime.strptime(START_TIME, '%Y-%m-%d %H:%M:%S')
-        end_dt = datetime.strptime(END_TIME, '%Y-%m-%d %H:%M:%S')
+        start_dt = pd.to_datetime(start_timestamp, unit='ms')
+        end_dt = pd.to_datetime(end_timestamp, unit='ms')
         time_span_hours = (end_dt - start_dt).total_seconds() / 3600
         
-        print(f"Time span: {time_span_hours:.1f} hours")
+        log_info(f"Time span: {time_span_hours:.1f} hours", logger)
         
         if time_span_hours < 48:
-            print("Time span is less than 48 hours - using all location data for clustering")
+            log_info("Time span is less than 48 hours - using all location data for clustering", logger)
             use_daily_clustering = False
         else:
-            print("Time span is 48 hours or more - using daily clustering based on night_time_end")
+            log_info("Time span is 48 hours or more - using daily clustering based on night_time_end", logger)
             use_daily_clustering = True
         
         # Perform DBSCAN clustering using haversine distance
-        print("Locations: Performing DBSCAN clustering")
+        log_info("Locations: Performing DBSCAN clustering", logger)
         
         try:
             if len(coordinates) > 0: # Ensure there are points to process
                 # Perform DBSCAN clustering using shared function
                 cluster_labels, daily_clusters = perform_dbscan_clustering(
                     coordinates, datetimes, eps, min_samples, use_daily_clustering, 
-                    start_dt, end_dt, night_time_end
+                    start_dt, end_dt, night_time_end, logger
                 )
                 
                 n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)  # Exclude noise
-                print(f"DBSCAN found {n_clusters} clusters (excluding noise)")
-                print(f"Noise points: {list(cluster_labels).count(-1)} out of {len(cluster_labels)}")
+                log_info(f"DBSCAN found {n_clusters} clusters (excluding noise)", logger)
+                log_info(f"Noise points: {list(cluster_labels).count(-1)} out of {len(cluster_labels)}", logger)
                 
                 # Process clustering results using shared function
                 (cluster, clustered_coordinates, clustered_labels, clustered_datetimes, 
                  clustered_indices, clustered_speeds, home_group_center) = process_clustering_results(
                     coordinates, cluster_labels, datetimes, indices, speeds,
-                    use_daily_clustering, daily_clusters, night_time_start, night_time_end
+                    use_daily_clustering, daily_clusters, night_time_start, night_time_end, logger
                 )
                 
                 # Update variables to use clustered data for the rest of the algorithm
@@ -273,20 +1038,24 @@ def process_participant(P_ID):
                 speeds = clustered_speeds
 
         except NameError as e:
-            print(f"Error: Variable not initialized - {e}")
-            print("Skipping location clustering due to error.")
+            log_error(f"Error: Variable not initialized - {e}", logger)
+            log_error("Skipping location clustering due to error.", logger)
+            return []
         except ValueError as e:
-            print(f"Error: {e}")
-            print("Skipping location clustering due to error.")
+            log_error(f"Error: {e}", logger)
+            log_error("Skipping location clustering due to error.", logger)
+            return []
         except Exception as e:
-            print(f"Unexpected error during clustering: {e}")
-            print("Skipping location clustering due to error.")
+            log_error(f"Unexpected error during clustering: {e}", logger)
+            log_error("Skipping location clustering due to error.", logger)
+            return []
     else:
-        print("No location data available for clustering")
+        log_info("No location data available for clustering", logger)
+        return []
 
-    # If a Google Maps API key is provided, perform reverse geocoding for all places
+    # If Google Maps is enabled and API key is provided, perform reverse geocoding for all places
     reverse_geocoding_performed = False
-    if GOOGLE_MAP_KEY and cluster:
+    if USE_GOOGLE_MAP and GOOGLE_MAP_KEY and cluster:
         gmaps = googlemaps.Client(key=GOOGLE_MAP_KEY)
         # a list to store all reverse geocoding results
         reverse_geocode_results = []
@@ -296,21 +1065,21 @@ def process_participant(P_ID):
                 if len(cluster_data) == 6:
                     cluster_id, center_lat, center_lon, num_points, place, distance_from_home = cluster_data
                 else:
-                    print(f"Warning: Cluster data at index {idx} has {len(cluster_data)} elements, expected 6. Skipping.")
+                    log_warning(f"Warning: Cluster data at index {idx} has {len(cluster_data)} elements, expected 6. Skipping.", logger)
                     continue
                 # Perform reverse geocoding for all places (both home and unknown)
                 reverse_geocode_data = None
                 try:
                     reverse_geocode_data = gmaps.reverse_geocode((center_lat, center_lon), enable_address_descriptor=True)
                 except (gexceptions.ApiError, gexceptions.HTTPError, gexceptions.Timeout, gexceptions.TransportError) as e:
-                    print(f"Error during reverse geocoding for ({center_lat}, {center_lon}): {e}")
+                    log_error(f"Error during reverse geocoding for ({center_lat}, {center_lon}): {e}", logger)
                     continue
                 except Exception as e:
-                    print(f"Unexpected error during reverse geocoding for ({center_lat}, {center_lon}): {e}")
+                    log_error(f"Unexpected error during reverse geocoding for ({center_lat}, {center_lon}): {e}", logger)
                     continue
 
                 if not reverse_geocode_data or reverse_geocode_data.get("status") != "OK":
-                    print(f"No valid address returned for ({center_lat}, {center_lon}).")
+                    log_warning(f"No valid address returned for ({center_lat}, {center_lon}).", logger)
                     continue
                 
                 # Process the reverse geocoding data
@@ -393,13 +1162,16 @@ def process_participant(P_ID):
                 )
 
         except Exception as e:
-            print(f"Error in Google Maps API request: {e}")
+            log_error(f"Error in Google Maps API request: {e}")
         
         # Save reverse geocoding results to the configured directory
-        # Parse the full END_TIME
-        start_date = datetime.strptime(START_TIME, '%Y-%m-%d %H:%M:%S').strftime('%Y%m%d%H%M%S')
-        end_date = datetime.strptime(END_TIME, '%Y-%m-%d %H:%M:%S').strftime('%Y%m%d%H%M%S')
-        filename = os.path.join(reverse_geocoding_output_dir, f"{P_ID}_{start_date}_{end_date}_reverse_geocode_results.json")
+        # Parse the timestamps for file naming
+        start_date = pd.to_datetime(start_timestamp, unit='ms').strftime('%Y%m%d%H%M%S')
+        end_date = pd.to_datetime(end_timestamp, unit='ms').strftime('%Y%m%d%H%M%S')
+        reverse_geocoding_output_dir = CONFIG["reverse_geocoding_output_dir"].format(P_ID=pid)
+        os.makedirs(reverse_geocoding_output_dir, exist_ok=True)
+        
+        filename = os.path.join(reverse_geocoding_output_dir, f"{pid}_{start_date}_{end_date}_reverse_geocode_results.json")
         
         with open(filename, "w", encoding='utf-8') as file:
             json.dump(reverse_geocode_results, file, indent=2, ensure_ascii=False, default=str)
@@ -421,21 +1193,21 @@ def process_participant(P_ID):
                     }
         
         # Save cluster mapping to JSON file
-        mapping_filename = os.path.join(reverse_geocoding_output_dir, f"{P_ID}_{start_date}_{end_date}_cluster_mapping.json")
+        mapping_filename = os.path.join(reverse_geocoding_output_dir, f"{pid}_{start_date}_{end_date}_cluster_mapping.json")
         with open(mapping_filename, "w", encoding='utf-8') as file:
             json.dump(cluster_mapping, file, indent=2, ensure_ascii=False, default=str)
         
-        print(f"Saved reverse geocoding results to: {filename}")
-        print(f"Saved cluster mapping to: {mapping_filename}")
+        log_info(f"Saved reverse geocoding results to: {filename}", logger)
+        log_info(f"Saved cluster mapping to: {mapping_filename}", logger)
         reverse_geocoding_performed = True
 
     # Display the updated cluster information only if reverse geocoding was performed successfully
     if len(coordinates) > 0 and cluster and reverse_geocoding_performed:
-        print("Cluster Centers (Updated):")
+        log_info("Cluster Centers (Updated):", logger)
         for cluster_data in cluster:
             if len(cluster_data) == 6:  # Must have exactly 6 elements
                 cluster_id, center_lat, center_lon, num_points, place, distance_from_home = cluster_data
-                print(f"Cluster {cluster_id}: Center Lat = {center_lat:.6f}, Center Lon = {center_lon:.6f}, N = {num_points}, Place = {place}, Distance = {distance_from_home:.1f}m")
+                log_info(f"Cluster {cluster_id}: Center Lat = {center_lat:.6f}, Center Lon = {center_lon:.6f}, N = {num_points}, Place = {place}, Distance = {distance_from_home:.1f}m", logger)
 
     # Generate descriptions for locations based on clustering results
     # Reconstruct points data for describe_locations_integrated function
@@ -451,42 +1223,192 @@ def process_participant(P_ID):
         
         reconstructed_points = np.array(reconstructed_points, dtype=object)
         
-        # Initialize locations narrative list
-        if "locations" not in sensor_narratives:
-            sensor_narratives["locations"] = []
-        
         # Generate integrated location descriptions
         location_narratives = describe_locations_integrated(
             reconstructed_points, cluster_labels, cluster, 
-            START_TIMESTAMP, END_TIMESTAMP, sessions
+            start_timestamp, end_timestamp, sessions
         )
         
+        return location_narratives
+    
+    return []
+
+
+def process_participant_manual_core(pid, participant_start_time, participant_end_time, output_file, daily_output_dir, logger=None):
+    """
+    Core processing logic for manual mode participant processing.
+    This function handles sensor data processing and generates manual mode outputs.
+    
+    Args:
+        pid (str): Participant ID to process
+        participant_start_time (str): Start time string
+        participant_end_time (str): End time string
+        output_file (str): Output file path
+        daily_output_dir (str): Daily output directory
+        logger: Logger instance for detailed logging
+        
+    Returns:
+        bool: True if processing was successful, False otherwise
+    """
+    
+    # Load device IDs for this participant
+    device_ids = get_device_ids_for_participant(pid)
+    if not device_ids:
+        log_warning(f"Warning: No device IDs found for participant {pid}. Skipping.", logger)
+        return False
+    
+    # Set up participant-specific paths
+    input_directory = CONFIG["input_directory"].format(P_ID=pid)
+    reverse_geocoding_output_dir = CONFIG["reverse_geocoding_output_dir"].format(P_ID=pid)
+    
+    # Ensure output directories exist
+    os.makedirs(daily_output_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    os.makedirs(reverse_geocoding_output_dir, exist_ok=True)
+    
+    jsonl_files = [(f"{sensor}.jsonl", sensor) for sensor in sensors]
+    
+    # Initialize participant-specific variables
+    sensor_narratives = {}
+    
+    # Convert start and end times to timestamps
+    start_timestamp = convert_timestring_to_timestamp(participant_start_time, CONFIG["timezone"])
+    end_timestamp = convert_timestring_to_timestamp(participant_end_time, CONFIG["timezone"])
+
+    # Load session data for accurate active time calculation
+    session_file_path = CONFIG.get("session_data_file", "").format(P_ID=pid)
+    sessions = load_session_data(session_file_path, logger)
+    
+    # If config session file not found, try the default location
+    if not sessions:
+        default_session_file = f"step1_data/{pid}/sessions.jsonl"
+        log_info(f"Trying default session file location: {default_session_file}", logger)
+        sessions = load_session_data(default_session_file, logger)
+    
+    log_info(f"Loaded {len(sessions)} session records", logger)
+
+    log_info(f"Keep data within time range: {participant_start_time} to {participant_end_time}", logger)
+    
+    #store location data in a list
+    location_data = []
+    
+    # Store WiFi sensor data separately for combined processing
+    wifi_sensor_data = {}
+
+    for jsonl_file, sensor_name in jsonl_files:      
+        sensor_data = get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_directory, logger)
+        #If sensor_data is not found, skip the sensor
+        if not sensor_data:
+            continue
+
+        # Convert to DataFrame for timestamp processing, then back to list of dictionaries
+        df = pd.DataFrame(sensor_data)
+        df = convert_timestamp_column(df, CONFIG["timezone"])
+        sensor_data = df.to_dict('records')
+
+        if sensor_name == "locations":
+            location_data = sensor_data
+            continue
+        
+        # Handle WiFi and network sensors specially for combined processing
+        if sensor_name in ["wifi", "sensor_wifi"]:
+            wifi_sensor_data[sensor_name] = sensor_data
+            log_info(f"Collected {sensor_name} data: {len(sensor_data)} records", logger)
+            continue
+        
+        # Initialize sensor-specific narrative list
+        if sensor_name not in sensor_narratives:
+            sensor_narratives[sensor_name] = []
+
+        # Generate integrated descriptions for each sensor
+        narratives = generate_integrated_description(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions, pid)
+        if narratives:
+            sensor_narratives[sensor_name].extend(narratives)
+
+    # Process WiFi sensors together if we have any type
+    if wifi_sensor_data:
+        sensor_wifi_data = wifi_sensor_data.get("sensor_wifi", [])
+        wifi_data = wifi_sensor_data.get("wifi", [])
+        
+        log_info(f"Processing combined WiFi analysis:", logger)
+        log_info(f"  - sensor_wifi: {len(sensor_wifi_data)} records", logger)
+        log_info(f"  - wifi: {len(wifi_data)} records", logger)
+        
+        # Generate combined WiFi narratives
+        combined_wifi_narratives = generate_wifi_combined_description(
+            sensor_wifi_data, wifi_data, start_timestamp, end_timestamp, sessions
+        )
+        
+        if combined_wifi_narratives:
+            # Store combined WiFi narratives under a unified key
+            sensor_narratives["wifi"] = combined_wifi_narratives
+            log_info(f"Generated {len(combined_wifi_narratives)} combined WiFi narratives", logger)
+
+    #summary len of each sensor narrative list
+    for sensor_name, narrative_list in sensor_narratives.items():
+        log_info(f"Sensor: {sensor_name}, Number of integrated descriptions: {len(narrative_list)}", logger)
+
+    # Process locations with clustering using the shared function
+    if location_data:
+        log_info(f"Processing location data with clustering for manual mode...", logger)
+        location_narratives = process_location_data_with_clustering(
+            location_data, start_timestamp, end_timestamp, sessions, pid, logger
+        )
         if location_narratives:
-            sensor_narratives["locations"].extend(location_narratives)
+            sensor_narratives["locations"] = location_narratives
+            log_info(f"Added {len(location_narratives)} location narratives to manual mode", logger)
+    else:
+        log_info("No location data available for processing", logger)
 
     all_narratives = []
     
     #load all narrative lists
     for sensor_name, sensor_narrative_list in sensor_narratives.items():
-        for item in sensor_narrative_list:
-            all_narratives.append(item)
+        for narrative_dict in sensor_narrative_list:
+            all_narratives.append(narrative_dict)
 
-    # Write output description to a text file
-    print("Output description into text file...")
-    # Remove duplicates first, then sort by time window and sensor order
-    unique_narratives = list(set(all_narratives))
-    all_narratives = sort_narratives_by_time_window_and_sensor_order(unique_narratives)
-    text = "\n".join([str(item[1]) for item in all_narratives])
-
-    # Save to file
-    with open(output_file, 'w', encoding='utf-8') as file:
-        file.write(text)
-        
-    # Split description by days and save each day's content to separate files
-    output_files = split_description_by_days(output_file, daily_output_dir)
-    print(f"Split description into {len(output_files)} daily files in {daily_output_dir}")
+    # Generate main description and daily descriptions directly (no temp files)
+    log_info("Generating output descriptions directly...", logger)
     
-    print(f"Completed processing for participant {P_ID}")
+    # Convert timestamps for manual mode boundaries
+    start_timestamp = convert_timestring_to_timestamp(participant_start_time, CONFIG["timezone"])
+    end_timestamp = convert_timestring_to_timestamp(participant_end_time, CONFIG["timezone"])
+    
+    # Use new direct generation approach
+    main_description, daily_descriptions, all_windows, daily_windows = generate_all_outputs_manual(
+        all_narratives, start_timestamp, end_timestamp, CONFIG["timezone"]
+    )
+    
+    # Write main output file
+    with open(output_file, 'w', encoding='utf-8') as file:
+        file.write(main_description)
+    
+    # Generate JSON output for manual mode
+    output_dir = os.path.dirname(output_file)
+    json_file = generate_json_output(all_windows, pid, output_dir=output_dir)
+    if json_file:
+        log_info(f"Generated JSON output: {os.path.basename(json_file)}", logger)
+    
+    # Write daily output files
+    output_files = []
+    for day_date, day_content in daily_descriptions.items():
+        daily_file = os.path.join(daily_output_dir, f"day_{day_date}.txt")
+        with open(daily_file, 'w', encoding='utf-8') as f:
+            f.write(day_content)
+        output_files.append(daily_file)
+
+        # Generate daily JSON output
+        if day_date in daily_windows and daily_windows[day_date]:
+            daily_json = generate_json_output(
+                daily_windows[day_date], pid, output_dir=daily_output_dir,
+                filename=f"day_{day_date}.json"
+            )
+            if daily_json:
+                log_info(f"Generated daily JSON: day_{day_date}.json", logger)
+
+    log_info(f"Generated main output, JSON output, and {len(output_files)} daily files in {daily_output_dir}", logger)
+    
+    log_info(f"Completed processing for participant {pid}", logger)
     return True
 
 def convert_timestring_to_timestamp(timestring, timezone_str="Australia/Melbourne"):
@@ -496,7 +1418,7 @@ def convert_timestring_to_timestamp(timestring, timezone_str="Australia/Melbourn
     try:
         tz = pytz.timezone(timezone_str)
     except pytz.exceptions.UnknownTimeZoneError:
-        print(f"Unknown timezone '{timezone_str}'. Falling back to UTC.")
+        log_warning(f"Unknown timezone '{timezone_str}'. Falling back to UTC.")
         tz = pytz.timezone("UTC")
     
     # Parse the timestring as a naive datetime, handling both with and without milliseconds
@@ -515,6 +1437,586 @@ def convert_timestring_to_timestamp(timestring, timezone_str="Australia/Melbourn
     
     return timestamp_ms
 
+def format_timestamp_with_conditional_offset(unix_timestamp, timezone_str):
+    """Format timestamp with conditional UTC offset for readability"""
+    dt = pd.to_datetime(unix_timestamp, unit='ms', utc=True)
+    local_time = dt.tz_convert(timezone_str)
+    
+    # Return both formatted time and offset for conditional display
+    time_str = local_time.strftime('%H:%M:%S')
+    offset_str = local_time.strftime('%z')
+    
+    # Format offset with colon (ISO 8601)
+    if len(offset_str) == 5:
+        offset_str = offset_str[:3] + ':' + offset_str[3:]
+    
+    return time_str, offset_str
+
+def generate_window_header_conditional_offset(window_start_ts, window_end_ts, window_number, timezone_str):
+    """Generate window header with conditional offset display"""
+    start_dt = pd.to_datetime(window_start_ts, unit='ms', utc=True).tz_convert(timezone_str)
+    end_dt = pd.to_datetime(window_end_ts, unit='ms', utc=True).tz_convert(timezone_str)
+    
+    # Get time strings and offsets
+    start_time, start_offset = format_timestamp_with_conditional_offset(window_start_ts, timezone_str)
+    end_time, end_offset = format_timestamp_with_conditional_offset(window_end_ts, timezone_str)
+    
+    # Generate day info
+    if start_dt.date() == end_dt.date():
+        day_name = start_dt.strftime('%A')
+        day_info = f"Day {start_dt.strftime('%Y-%m-%d')} ({day_name})"
+    else:
+        start_day_name = start_dt.strftime('%A')
+        end_day_name = end_dt.strftime('%A')
+        day_info = f"Day {start_dt.strftime('%Y-%m-%d')} ({start_day_name}) to {end_dt.strftime('%Y-%m-%d')} ({end_day_name})"
+    
+    # Conditional offset display - only show when different
+    if start_offset == end_offset:
+        time_range = f"{start_time} - {end_time}"  # Clean display
+    else:
+        time_range = f"{start_time}{start_offset} - {end_time}{end_offset}"  # Show offsets
+    
+    return f"Window {window_number}\n{day_info}\n{time_range}"
+
+def generate_all_outputs_auto(narratives, survey_time_unix, time_ranges, timezone_str, direction="backward"):
+    """
+    Generate multiple time ranges AND daily descriptions simultaneously.
+    Ultimate efficiency - single pass through narratives.
+
+    Args:
+        narratives: List of narrative dictionaries with unix_timestamp
+        survey_time_unix: Reference timestamp in milliseconds
+        time_ranges: List of time range strings (e.g., ['7d', '3d', '24h'])
+        timezone_str: Timezone string for formatting
+        direction: "backward" (survey_time is END, default) or "forward" (survey_time is START)
+
+    Returns:
+        tuple: (time_range_descriptions, daily_descriptions, time_range_windows, daily_windows)
+               time_range_descriptions: dict mapping time_range -> description text
+               daily_descriptions: dict mapping day -> description text
+               time_range_windows: dict mapping time_range -> list of window data
+               daily_windows: dict mapping day -> list of window data dicts
+    """
+    from collections import defaultdict
+
+    # Pre-calculate time range boundaries based on direction
+    time_range_boundaries = {}
+    for time_range in time_ranges:
+        range_duration_ms = parse_time_range_duration(time_range)
+        if direction == "forward":
+            # Forward: survey_time is START, boundary is the END of each range
+            time_range_boundaries[time_range] = survey_time_unix + range_duration_ms
+        else:
+            # Backward (default): survey_time is END, boundary is the START of each range
+            time_range_boundaries[time_range] = survey_time_unix - range_duration_ms
+
+    # Group narratives by time windows
+    window_size_ms = sensor_integration_time_window * 60 * 1000
+
+    # Determine the full processing range based on direction
+    if direction == "forward":
+        range_start = survey_time_unix
+        range_end = max(time_range_boundaries.values())
+    else:
+        range_start = min(time_range_boundaries.values())
+        range_end = survey_time_unix
+
+    window_groups = defaultdict(list)
+    for narrative in narratives:
+        unix_ts = narrative['unix_timestamp']
+        if range_start <= unix_ts <= range_end:
+            window_start = ((unix_ts - range_start) // window_size_ms) * window_size_ms + range_start
+            window_groups[window_start].append(narrative)
+
+    # Prepare output collections - store window data instead of formatted content
+    time_range_windows = {tr: [] for tr in time_ranges}
+    daily_windows = defaultdict(list)
+
+    # Process each window once, assign to all applicable outputs
+    for window_start in sorted(window_groups.keys()):
+        window_end = window_start + window_size_ms
+        window_narratives = window_groups[window_start]
+
+        # Generate window content without header (we'll add headers with correct numbers later)
+        window_content = format_window_content_without_header(window_narratives)
+
+        if window_content:  # Only process windows with content
+            # Store window data (timing + content + narratives) instead of formatted string
+            window_data = {
+                'start': window_start,
+                'end': window_end,
+                'content': window_content,
+                'narratives': window_narratives
+            }
+
+            # Determine day for this window
+            window_dt = pd.to_datetime(window_start, unit='ms', utc=True).tz_convert(timezone_str)
+            day_str = window_dt.strftime('%Y-%m-%d')
+            daily_windows[day_str].append(window_data)
+
+            # Assign to applicable time ranges based on direction
+            for time_range, boundary in time_range_boundaries.items():
+                if direction == "forward":
+                    # Forward: include window if window_start < boundary (end of range)
+                    if window_start < boundary:
+                        time_range_windows[time_range].append(window_data)
+                else:
+                    # Backward: include window if window_start >= boundary (start of range)
+                    if boundary <= window_start:
+                        time_range_windows[time_range].append(window_data)
+    
+    # Format final outputs with relative window numbering
+    time_range_descriptions = {}
+    for time_range, window_data_list in time_range_windows.items():
+        if window_data_list:
+            # Generate complete windows with relative numbering (1, 2, 3, ...)
+            formatted_windows = []
+            for relative_window_num, window_data in enumerate(window_data_list, 1):
+                # Generate header with relative window number
+                header = generate_window_header_conditional_offset(
+                    window_data['start'], window_data['end'], relative_window_num, timezone_str
+                )
+                
+                # Combine header and content
+                complete_window = f"{header}\n{window_data['content']}"
+                formatted_windows.append(complete_window)
+            
+            time_range_descriptions[time_range] = "\n\n".join(formatted_windows)
+        else:
+            time_range_descriptions[time_range] = ""
+    
+    # Format daily descriptions with relative window numbering within each day
+    daily_descriptions = {}
+    for day, window_data_list in daily_windows.items():
+        if window_data_list:
+            # Generate complete windows with relative numbering within each day (1, 2, 3, ...)
+            formatted_windows = []
+            for relative_window_num, window_data in enumerate(window_data_list, 1):
+                # Generate header with relative window number
+                header = generate_window_header_conditional_offset(
+                    window_data['start'], window_data['end'], relative_window_num, timezone_str
+                )
+                
+                # Combine header and content
+                complete_window = f"{header}\n{window_data['content']}"
+                formatted_windows.append(complete_window)
+            
+            daily_descriptions[day] = "\n\n".join(formatted_windows)
+        else:
+            daily_descriptions[day] = ""
+    
+    return time_range_descriptions, daily_descriptions, time_range_windows, daily_windows
+
+def generate_all_outputs_manual(narratives, start_timestamp, end_timestamp, timezone_str):
+    """Generate main description AND daily descriptions for manual mode"""
+    from collections import defaultdict
+    
+    # Group narratives by time windows
+    window_size_ms = sensor_integration_time_window * 60 * 1000
+    window_groups = defaultdict(list)
+    
+    for narrative in narratives:
+        unix_ts = narrative['unix_timestamp']
+        if start_timestamp <= unix_ts <= end_timestamp:
+            window_start = ((unix_ts - start_timestamp) // window_size_ms) * window_size_ms + start_timestamp
+            window_groups[window_start].append(narrative)
+    
+    all_windows = []
+    daily_windows = defaultdict(list)
+    
+    for window_start in sorted(window_groups.keys()):
+        window_end = window_start + window_size_ms
+        window_narratives = window_groups[window_start]
+        
+        # Generate window content without header (we'll add headers with correct numbers later)
+        window_content = format_window_content_without_header(window_narratives)
+        
+        if window_content:  # Only process windows with content
+            # Store window data (timing + content + narratives) instead of formatted string
+            window_data = {
+                'start': window_start,
+                'end': window_end,
+                'content': window_content,
+                'narratives': window_narratives
+            }
+            
+            # Add window_id for manual mode
+            window_data['window_id'] = len(all_windows) + 1
+            all_windows.append(window_data)
+            
+            # Also assign to daily output
+            window_dt = pd.to_datetime(window_start, unit='ms', utc=True).tz_convert(timezone_str)
+            day_str = window_dt.strftime('%Y-%m-%d')
+            daily_windows[day_str].append(window_data)
+    
+    # Format main description with sequential numbering
+    if all_windows:
+        formatted_windows = []
+        for window_num, window_data in enumerate(all_windows, 1):
+            # Generate header with sequential window number
+            header = generate_window_header_conditional_offset(
+                window_data['start'], window_data['end'], window_num, timezone_str
+            )
+            
+            # Combine header and content
+            complete_window = f"{header}\n{window_data['content']}"
+            formatted_windows.append(complete_window)
+        
+        main_description = "\n\n".join(formatted_windows)
+    else:
+        main_description = ""
+    
+    # Format daily descriptions with relative window numbering within each day
+    daily_descriptions = {}
+    for day, window_data_list in daily_windows.items():
+        if window_data_list:
+            # Generate complete windows with relative numbering within each day (1, 2, 3, ...)
+            formatted_windows = []
+            for relative_window_num, window_data in enumerate(window_data_list, 1):
+                # Generate header with relative window number
+                header = generate_window_header_conditional_offset(
+                    window_data['start'], window_data['end'], relative_window_num, timezone_str
+                )
+                
+                # Combine header and content
+                complete_window = f"{header}\n{window_data['content']}"
+                formatted_windows.append(complete_window)
+            
+            daily_descriptions[day] = "\n\n".join(formatted_windows)
+        else:
+            daily_descriptions[day] = ""
+    
+    return main_description, daily_descriptions, all_windows, daily_windows
+
+
+def format_window_content_without_header(window_narratives):
+    """Format window content without header - just the narrative content"""
+    if not window_narratives:
+        return ""
+    
+    # Sort narratives by sensor category
+    sorted_narratives = sort_narratives_by_sensor_category(window_narratives)
+    
+    content_lines = []
+    current_category = None
+    
+    for narrative in sorted_narratives:
+        # Add category headers
+        category = get_sensor_category(narrative['sensor_type'])
+        if category != current_category:
+            if content_lines:  # Add empty line before new category (except for first)
+                content_lines.append("")
+            content_lines.append(get_category_display_name(category))
+            current_category = category
+        
+        # Add narrative content
+        formatted_description = f"- {narrative['description']}"
+        content_lines.append(formatted_description)
+    
+    return "\n".join(content_lines)
+
+
+def generate_json_output(windows_data, pid, survey_id=None, time_range=None, output_dir=None, filename=None):
+    """
+    Generate JSON output for both auto and manual modes.
+    
+    Args:
+        windows_data: For auto mode: dict of window data; for manual mode: list of window dicts
+        pid (str): Participant ID
+        survey_id (str, optional): Survey ID (for auto mode)
+        time_range (str, optional): Time range (for auto mode)
+        output_dir (str): Output directory
+        
+    Returns:
+        str: Path to the generated JSON file, or None if no windows
+    """
+    json_data = []
+    
+    # Handle both auto and manual modes (windows_data is a list of window data)
+    if isinstance(windows_data, list):
+        for window_idx, window_data in enumerate(windows_data, 1):
+            # Determine window_id - use existing one if available (manual mode), otherwise use index (auto mode)
+            window_id = window_data.get('window_id', window_idx)
+            
+            # Generate the complete window description (header + content) for auto mode
+            if 'content' in window_data:
+                # Auto mode - generate description from content
+                header = generate_window_header_conditional_offset(
+                    window_data['start'], window_data['end'], window_idx, timezone
+                )
+                complete_description = f"{header}\n{window_data['content']}"
+            else:
+                # Manual mode - use existing description
+                complete_description = window_data['description']
+            
+            # Generate categorized description directly from narratives
+            categorized_description = generate_categorized_description_from_narratives(window_data.get('narratives', []))
+            
+            # Generate window description header
+            window_description = generate_window_header_conditional_offset(
+                window_data['start'], 
+                window_data.get('end', window_data['start'] + (sensor_integration_time_window * 60 * 1000)), 
+                window_id, 
+                timezone
+            )
+            
+            json_element = {
+                'window_id': window_id,
+                'window_description': window_description,
+                'description': complete_description,  # Keep original description for backward compatibility
+                'categorized_description': categorized_description,
+                'window_info': {
+                    'start_timestamp': window_data['start'],
+                    'end_timestamp': window_data.get('end', window_data['start'] + (sensor_integration_time_window * 60 * 1000)),
+                    'duration_minutes': sensor_integration_time_window,
+                    'narrative_count': len(window_data.get('narratives', [])),
+                    'sensor_types': list(set(narrative['sensor_type'] for narrative in window_data.get('narratives', [])))
+                }
+            }
+            json_data.append(json_element)
+    
+    if not json_data:
+        return None
+    
+    # Determine filename based on mode
+    if filename:
+        json_filename = filename
+    elif survey_id and time_range:
+        # Auto mode
+        json_filename = f"{pid}_{survey_id}_{time_range}.json"
+    else:
+        # Manual mode
+        json_filename = f"{pid}_manual.json"
+
+    json_filepath = os.path.join(output_dir, json_filename)
+    
+    # Strip invisible Unicode control characters from all strings in the output
+    json_data = _sanitize_unicode_recursive(json_data)
+
+    # Write JSON file with UTF-8 encoding and pretty printing
+    with open(json_filepath, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2)
+    
+    return json_filepath
+
+
+def generate_categorized_description_from_narratives(narratives):
+    """
+    Generate categorized description directly from narrative list.
+    
+    Args:
+        narratives (list): List of narrative dictionaries with keys:
+                          - unix_timestamp: Unix timestamp in milliseconds
+                          - sensor_type: Sensor type string
+                          - description: Human-readable narrative text
+        
+    Returns:
+        dict: Dictionary with 4 category keys containing sensor names as keys and descriptions as values
+    """
+    # Initialize categories with empty dictionaries
+    categories = {
+        'environmental_context': {},
+        'communication_events': {},
+        'device_state': {},
+        'engagement_signals': {}
+    }
+    
+    if not narratives:
+        return categories
+    
+    # Define sensor categories mapping
+    sensor_categories = {
+        # Environmental context
+        'locations': 'environmental_context',
+        'wifi': 'environmental_context',
+        'bluetooth': 'environmental_context',
+        # Communication events
+        'notifications': 'communication_events',
+        'applications_notifications': 'communication_events',  # Added missing sensor type
+        'calls': 'communication_events',
+        'messages': 'communication_events',
+        # Device state
+        'battery': 'device_state',
+        'installations': 'device_state',
+        # Engagement signals
+        'screen': 'engagement_signals',
+        'applications': 'engagement_signals',
+        'keyboard': 'engagement_signals',
+        'screentext': 'engagement_signals'
+    }
+    
+    # Group narratives by sensor type
+    sensor_groups = {}
+    for narrative in narratives:
+        sensor_type = narrative.get('sensor_type', '')
+        if sensor_type and sensor_type != 'header':  # Skip header narratives
+            if sensor_type not in sensor_groups:
+                sensor_groups[sensor_type] = []
+            sensor_groups[sensor_type].append(narrative)
+    
+    # Organize into categories
+    for sensor_type, sensor_narratives in sensor_groups.items():
+        category = sensor_categories.get(sensor_type, 'other')
+        if category in categories:
+            # Combine all descriptions for this sensor type
+            descriptions = []
+            for narrative in sensor_narratives:
+                description = narrative.get('description', '').strip()
+                if description:
+                    # Remove the "- " prefix if present
+                    if description.startswith("- "):
+                        description = description[2:]
+                    descriptions.append(description)
+            
+            if descriptions:
+                categories[category][sensor_type] = '\n'.join(descriptions)
+    
+    return categories
+
+
+def parse_description_to_categories(description):
+    """
+    Parse a window description into categorized sections.
+    
+    Args:
+        description (str): The complete window description text
+        
+    Returns:
+        dict: Dictionary with 4 category keys containing sensor names as keys and descriptions as values
+    """
+    # Initialize categories with empty dictionaries
+    categories = {
+        'environmental_context': {},
+        'communication_events': {},
+        'device_state': {},
+        'engagement_signals': {}
+    }
+    
+    if not description or not description.strip():
+        return categories
+    
+    lines = description.split('\n')
+    current_category = None
+    current_sensor = None
+    current_description = []
+    
+    for line in lines:
+        line = line.strip()
+        
+        # Skip empty lines
+        if not line:
+            continue
+        
+        # Check for category headers
+        if line == "Environmental Context":
+            # Save previous sensor content
+            if current_category and current_sensor and current_description:
+                categories[current_category][current_sensor] = '\n'.join(current_description)
+            
+            current_category = 'environmental_context'
+            current_sensor = None
+            current_description = []
+        elif line == "Communication Events":
+            # Save previous sensor content
+            if current_category and current_sensor and current_description:
+                categories[current_category][current_sensor] = '\n'.join(current_description)
+            
+            current_category = 'communication_events'
+            current_sensor = None
+            current_description = []
+        elif line == "Device State":
+            # Save previous sensor content
+            if current_category and current_sensor and current_description:
+                categories[current_category][current_sensor] = '\n'.join(current_description)
+            
+            current_category = 'device_state'
+            current_sensor = None
+            current_description = []
+        elif line == "Engagement Signals":
+            # Save previous sensor content
+            if current_category and current_sensor and current_description:
+                categories[current_category][current_sensor] = '\n'.join(current_description)
+            
+            current_category = 'engagement_signals'
+            current_sensor = None
+            current_description = []
+        elif line.startswith("Window ") or line.startswith("Day ") or " - " in line:
+            # Skip window headers and time ranges
+            continue
+        elif current_category and line.startswith("- "):
+            # This is a sensor description line
+            # Extract sensor name from the line (format: "- sensor_name | description")
+            parts = line[2:].split(" | ", 1)  # Remove "- " and split on first " | "
+            if len(parts) == 2:
+                sensor_name = parts[0].strip()
+                sensor_description = parts[1].strip()
+                
+                # Save previous sensor content
+                if current_sensor and current_description:
+                    categories[current_category][current_sensor] = '\n'.join(current_description)
+                
+                # Start new sensor
+                current_sensor = sensor_name
+                current_description = [sensor_description]
+            else:
+                # If no " | " found, treat as continuation of current sensor
+                if current_sensor:
+                    current_description.append(line[2:])  # Remove "- " prefix
+        elif current_category and current_sensor and line.startswith("    "):
+            # This is a continuation line for the current sensor (indented)
+            current_description.append(line)
+    
+    # Save the last sensor content
+    if current_category and current_sensor and current_description:
+        categories[current_category][current_sensor] = '\n'.join(current_description)
+    
+    return categories
+
+def get_sensor_category(sensor_type):
+    """Get category for sensor type"""
+    sensor_categories = {
+        'locations': 'environmental_context',
+        'wifi': 'environmental_context',
+        'bluetooth': 'environmental_context',
+        'notifications': 'communication_events', # FIXME: remove it
+        'applications_notifications': 'communication_events',  # Added missing sensor type
+        'calls': 'communication_events',
+        'messages': 'communication_events',
+        'battery': 'device_state',
+        'installations': 'device_state',
+        'screen': 'engagement_signals',
+        'applications': 'engagement_signals',
+        'keyboard': 'engagement_signals',
+        'screentext': 'engagement_signals'
+    }
+    return sensor_categories.get(sensor_type, 'other')
+
+def get_category_display_name(category):
+    """Get display name for category"""
+    display_names = {
+        'environmental_context': 'Environmental Context',
+        'communication_events': 'Communication Events',
+        'device_state': 'Device State', 
+        'engagement_signals': 'Engagement Signals'
+    }
+    return display_names.get(category, category)
+
+def sort_narratives_by_sensor_category(narratives):
+    """Sort narratives by sensor category priority"""
+    category_order = [
+        'environmental_context', 'communication_events', 
+        'device_state', 'engagement_signals'
+    ]
+    
+    def get_priority(narrative):
+        category = get_sensor_category(narrative['sensor_type'])
+        try:
+            return category_order.index(category)
+        except ValueError:
+            return len(category_order)
+    
+    return sorted(narratives, key=get_priority)
+
 def convert_timestamp_column(df, timezone_str="Australia/Melbourne"):
     """
     Convert timestamp columns to the provided timezone (accounting for DST) 
@@ -530,7 +2032,7 @@ def convert_timestamp_column(df, timezone_str="Australia/Melbourne"):
     try:
         tz = pytz.timezone(timezone_str)
     except pytz.exceptions.UnknownTimeZoneError:
-        print(f"Unknown timezone '{timezone_str}'. Falling back to UTC.")
+        log_warning(f"Unknown timezone '{timezone_str}'. Falling back to UTC.")
         tz = pytz.timezone("UTC")
     
     def convert_with_offset(ts):
@@ -568,7 +2070,7 @@ def should_filter_system_ui_app(record, sensor_name):
             record.get('is_system_app', 0) == 1 and
             record.get('package_name') in system_ui_apps)
 
-def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
+def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir, logger=None):
     """
     Load sensor data from JSONL file and filter by timestamp range.
     
@@ -577,7 +2079,8 @@ def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
         start_timestamp (float): Start timestamp in milliseconds
         end_timestamp (float): End timestamp in milliseconds
         input_dir (str): Input directory path
-    
+        logger: Logger instance for detailed logging
+        
     Returns:
         list: List of sensor records within the timestamp range
     """
@@ -586,7 +2089,7 @@ def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
     
     # Check if file exists
     if not os.path.exists(file_path):
-        print(f"Warning: Sensor file {file_path} not found")
+        log_warning(f"Warning: Sensor file {file_path} not found", logger)
         return []
     
     filtered_records = []
@@ -612,20 +2115,20 @@ def get_sensor_data(sensor_name, start_timestamp, end_timestamp, input_dir):
                         filtered_records.append(record)
                         
                 except json.JSONDecodeError as e:
-                    print(f"Warning: Failed to parse JSON line in {file_path}: {e}")
+                    log_warning(f"Warning: Failed to parse JSON line in {file_path}: {e}", logger)
                     continue
     
         # Sort records by _id then by timestamp
         filtered_records = sorted(filtered_records, key=lambda x: (x.get('_id', ''), x.get('timestamp', 0)))
                         
     except FileNotFoundError:
-        print(f"Error: File {file_path} not found")
+        log_error(f"Error: File {file_path} not found", logger)
         return []
     except Exception as e:
-        print(f"Error reading file {file_path}: {e}")
+        log_error(f"Error reading file {file_path}: {e}", logger)
         return []
     
-    print(f"Loaded {len(filtered_records)} records from {sensor_name} sensor")
+    log_info(f"Loaded {len(filtered_records)} records from {sensor_name} sensor", logger)
     return filtered_records
 
 def _create_fallback_app_sequence(window_apps):
@@ -1217,7 +2720,10 @@ def format_app_usage_narratives(app_summaries):
         app_summaries (list): List of app usage summaries from time windows
         
     Returns:
-        list: List of formatted narrative tuples (datetime, description)
+        list: List of formatted narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('applications')
+              - description: Human-readable narrative text
     """
     narratives = []
     
@@ -1257,7 +2763,7 @@ def format_app_usage_narratives(app_summaries):
         active_mins = int(total_active_minutes)
         active_secs = int((total_active_minutes - active_mins) * 60)
         
-        description_parts = [f"{datetime_str} | applications | App Usage"]
+        description_parts = [f"applications | App Usage"]
         
         # Add total active time
         description_parts.append(f"    - Total active time: {active_mins} min {active_secs} sec")
@@ -1371,16 +2877,36 @@ def format_app_usage_narratives(app_summaries):
                         description_parts.append(f"         - {app['name']} ({duration_mins} min {duration_secs} sec; {percentage}% of active periods){extension_info}")
         
         description = '\n'.join(description_parts)
-        narratives.append((datetime_str, description))
+        narratives.append({
+            'unix_timestamp': window_start_ts,  # Use actual unix timestamp from summary
+            'sensor_type': 'applications',
+            'description': description
+        })
     
     return narratives
 
 def describe_applications_foreground_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
-    """Generates a description for foreground applications detected."""
-    print("Generating integrated description for applications_foreground")
+    """
+    Generate integrated foreground applications analysis by time windows.
+    Generates app usage summaries and formats them into narrative descriptions.
+    
+    Args:
+        sensor_data (list): List of application sensor records
+        sensor_name (str): Name of the sensor (should be 'applications_foreground')
+        start_timestamp (float): Start timestamp in milliseconds
+        end_timestamp (float): End timestamp in milliseconds
+        sessions (list, optional): List of session records for session correlation
+        
+    Returns:
+        list: List of formatted application narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('applications')
+              - description: Human-readable narrative text
+    """
+    log_info("Generating integrated description for applications_foreground")
     
     if not sensor_data:
-        print("No application data available, skipping applications_foreground integration")
+        log_info("No application data available, skipping applications_foreground integration")
         return []
     
     # Generate app usage summaries by time window
@@ -1396,7 +2922,7 @@ def describe_applications_foreground_integrated(sensor_data, sensor_name, start_
     # Format summaries into narratives
     narratives = format_app_usage_narratives(app_summaries)
     
-    print(f"Generated {len(narratives)} app usage narratives for {len(app_summaries)} time windows (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} app usage narratives for {len(app_summaries)} time windows (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 
@@ -1417,21 +2943,24 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
         sessions (list, optional): List of session records for session correlation
         
     Returns:
-        list: List of formatted location narrative tuples (datetime, description)
+        list: List of formatted location narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('locations')
+              - description: Human-readable narrative text
     
     Note: Speed data is not used for movement analysis due to unreliable sampling frequency.
     """
-    print("Generating integrated description for locations")
+    log_info("Generating integrated description for locations")
     
     if len(all_points) == 0 or len(cluster_labels) == 0:
-        print("No location data available, skipping location integration")
+        log_info("No location data available, skipping location integration")
         return []
     
     # Build a richer cluster_id_to_info map
     cluster_id_to_info = {}
-    print("DEBUG: Processing cluster data:")
+    log_info("DEBUG: Processing cluster data:")
     for cid, lat, lon, n_pts, raw_place, dist in cluster:
-        print(f"  Cluster {cid}: {raw_place[:100]}...")
+        log_info(f"  Cluster {cid}: {raw_place[:100]}...")
         # 1. split off a "home." prefix if present
         is_home = raw_place.startswith("home. ")
         if is_home:
@@ -1569,33 +3098,34 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
                     sequence_labels.append(display_lbl)
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | locations | Location Analysis"]
-        
         # Show basic statistics
         total_locations = len(location_visits)
+
+        # Skip windows with no significant locations
+        if total_locations == 0:
+            return None
+
+        description_parts = [f"locations | Significant Location Analysis"]
+
         if total_locations == 1:
             description_parts.append(f"    - Visited {total_locations} location")
         else:
             description_parts.append(f"    - Visited {total_locations} locations")
-        
+
         # Show location transitions
         location_transitions = len(sequence_labels) - 1 if len(sequence_labels) > 1 else 0
         if location_transitions > 0:
             description_parts.append(f"    - Location transitions: {location_transitions}")
-        
+
         # Show location sequence if there are multiple locations
         if len(sequence_labels) > 1:
             sequence_str = " → ".join(sequence_labels)
             description_parts.append(f"    - Location sequence: {sequence_str}")
-        
+
         # Show detailed location information
         # Sort locations by chronological order (first occurrence time)
-        sorted_locations = sorted(location_visits.items(), 
+        sorted_locations = sorted(location_visits.items(),
                                  key=lambda x: x[1]['visit_periods'][0]['start_time'] if x[1]['visit_periods'] else 0)
-        
-        if not sorted_locations:
-            description_parts.append(f"    - No significant locations detected (insufficient data points)")
-            return '\n'.join(description_parts)
         
         description_parts.append(f"    - Time spent at locations:")
         
@@ -1644,7 +3174,7 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
             
             description_parts.append(f"         - {display_label}: {time_str}{suffix}")
 
-            # 2) now dump your saved human‐sentence and address
+            # 2) now dump your saved human-sentence and address
             if cid is not None:
                 info = cluster_id_to_info[cid]
 
@@ -1706,7 +3236,7 @@ def describe_locations_integrated(all_points, cluster_labels, cluster, start_tim
         location_records, "locations", start_timestamp, end_timestamp, process_location_window
     )
     
-    print(f"Generated {len(narratives)} location narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} location narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def process_sensor_by_timewindow(sensor_data, sensor_name, start_timestamp, end_timestamp, process_window_func):
@@ -1721,7 +3251,10 @@ def process_sensor_by_timewindow(sensor_data, sensor_name, start_timestamp, end_
         process_window_func (callable): Function to process each window's data
         
     Returns:
-        list: List of formatted narrative tuples (datetime, description)
+        list: List of formatted narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type string
+              - description: Human-readable narrative text
     """
     if not sensor_data:
         return []
@@ -1761,7 +3294,11 @@ def process_sensor_by_timewindow(sensor_data, sensor_name, start_timestamp, end_
         description = process_window_func(window_data, datetime_str, current_window_start, current_window_end)
         
         if description:
-            narratives.append((datetime_str, description))
+            narratives.append({
+                'unix_timestamp': current_window_start,  # Use actual unix timestamp
+                'sensor_type': sensor_name,
+                'description': description
+            })
         
         current_window_start = current_window_end
         window_id += 1
@@ -1813,12 +3350,15 @@ def describe_bluetooth_integrated(sensor_data, sensor_name, start_timestamp, end
         sessions (list, optional): List of session records (unused for bluetooth)
         
     Returns:
-        list: List of formatted bluetooth narrative tuples (datetime, description)
+        list: List of formatted bluetooth narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('bluetooth')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for bluetooth")
+    log_info("Generating integrated description for bluetooth")
     
     if sensor_name != "bluetooth" or not sensor_data:
-        print("No bluetooth data available, skipping bluetooth integration")
+        log_info("No bluetooth data available, skipping bluetooth integration")
         return []
     
     def process_bluetooth_gate(gate_data):
@@ -2025,7 +3565,7 @@ def describe_bluetooth_integrated(sensor_data, sensor_name, start_timestamp, end
             return None
         
         # Generate description for the window
-        description_parts = [f"{datetime_str} | bluetooth | Bluetooth Devices Detected"]
+        description_parts = [f"bluetooth | Bluetooth Devices Detected"]
         
         # Show average and range of unique devices (calculated from gate_time_window-min gate scans)
         if min_unique_devices == max_unique_devices:
@@ -2064,7 +3604,7 @@ def describe_bluetooth_integrated(sensor_data, sensor_name, start_timestamp, end
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_bluetooth_window
     )
     
-    print(f"Generated {len(narratives)} bluetooth narratives with averaged {gate_time_window}-minute gate statistics (window size: {sensor_integration_time_window} minutes, filtering out default/manufacturer device names and grouping by device name)")
+    log_info(f"Generated {len(narratives)} bluetooth narratives with averaged {gate_time_window}-minute gate statistics (window size: {sensor_integration_time_window} minutes, filtering out default/manufacturer device names and grouping by device name)")
     return narratives
 
 def describe_battery_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
@@ -2079,12 +3619,15 @@ def describe_battery_integrated(sensor_data, sensor_name, start_timestamp, end_t
         sessions (list, optional): List of session records (unused for battery)
         
     Returns:
-        list: List of formatted battery narrative tuples (datetime, description)
+        list: List of formatted battery narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('battery')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for battery")
+    log_info("Generating integrated description for battery")
     
     if sensor_name != "battery" or not sensor_data:
-        print("No battery data available, skipping battery integration")
+        log_info("No battery data available, skipping battery integration")
         return []
     
     # Battery status mapping
@@ -2154,7 +3697,7 @@ def describe_battery_integrated(sensor_data, sensor_name, start_timestamp, end_t
             return None
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | battery | Status changes"]
+        description_parts = [f"battery | Status changes"]
         
         for period in window_periods:
             if period['start_datetime'] == period['end_datetime']:
@@ -2192,7 +3735,7 @@ def describe_battery_integrated(sensor_data, sensor_name, start_timestamp, end_t
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_battery_window
     )
     
-    print(f"Generated {len(narratives)} battery narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} battery narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def describe_applications_notifications_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
@@ -2208,12 +3751,15 @@ def describe_applications_notifications_integrated(sensor_data, sensor_name, sta
         sessions (list, optional): List of session records for session correlation
         
     Returns:
-        list: List of formatted notifications narrative tuples (datetime, description)
+        list: List of formatted notifications narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('notifications')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for applications_notifications")
+    log_info("Generating integrated description for applications_notifications")
     
     if sensor_name != "applications_notifications" or not sensor_data:
-        print("No applications_notifications data available, skipping notifications integration")
+        log_info("No applications_notifications data available, skipping notifications integration")
         return []
     
     def process_notifications_window(window_data, datetime_str, window_start, window_end):
@@ -2265,7 +3811,7 @@ def describe_applications_notifications_integrated(sensor_data, sensor_name, sta
             total_notifications += 1
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | notifications | Notification Activity"]
+        description_parts = [f"notifications | Notification Activity"]
         
         # Show total notifications summary
         if total_notifications > 0:
@@ -2341,10 +3887,10 @@ def describe_applications_notifications_integrated(sensor_data, sensor_name, sta
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_notifications_window
     )
     
-    print(f"Generated {len(narratives)} applications_notifications narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} applications_notifications narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
-def generate_integrated_description(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
+def generate_integrated_description(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None, pid=None):
     """Generates an integrated description for the sensor."""
     if sensor_name == "applications_foreground":
         return describe_applications_foreground_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions)
@@ -2358,7 +3904,7 @@ def generate_integrated_description(sensor_data, sensor_name, start_timestamp, e
     elif sensor_name == "screen":
         return describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions)
     elif sensor_name == "screentext":
-        return describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions)
+        return describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions, pid)
     elif sensor_name == "calls":
         return describe_calls_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions)
     elif sensor_name == "installations":
@@ -2373,7 +3919,7 @@ def generate_integrated_description(sensor_data, sensor_name, start_timestamp, e
         return []
     else:
         # For other sensors, print sensor not supported
-        print(f"Sensor {sensor_name} not supported")
+        log_info(f"Sensor {sensor_name} not supported")
         return []
 
 
@@ -2395,12 +3941,13 @@ def generate_wifi_combined_description(sensor_wifi_data, wifi_data, start_timest
     return describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timestamp, end_timestamp, sessions)
 
     
-def load_session_data(session_file_path):
+def load_session_data(session_file_path, logger=None):
     """
     Load session data from JSONL file.
     
     Args:
         session_file_path (str): Path to the sessions.jsonl file
+        logger: Logger instance for detailed logging
         
     Returns:
         list: List of session records
@@ -2412,12 +3959,13 @@ def load_session_data(session_file_path):
                 if line.strip():
                     sessions.append(json.loads(line.strip()))
     except FileNotFoundError:
-        print(f"Warning: Session file {session_file_path} not found. Using estimated active time.")
+        log_warning(f"Warning: Session file {session_file_path} not found. Using estimated active time.", logger)
         return []
     except Exception as e:
-        print(f"Error loading session data: {e}. Using estimated active time.")
+        log_error(f"Error loading session data: {e}. Using estimated active time.", logger)
         return []
     
+    log_info(f"Loaded {len(sessions)} session records", logger)
     return sessions
 
 def calculate_active_time_from_sessions(sessions, start_ts, end_ts):
@@ -2481,12 +4029,15 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
         sessions (list, optional): List of session records for session info
         
     Returns:
-        list: List of formatted keyboard narrative tuples (datetime, description)
+        list: List of formatted keyboard narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('keyboard')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for keyboard")
+    log_info("Generating integrated description for keyboard")
     
     if sensor_name != "keyboard" or not sensor_data:
-        print("No keyboard data available, skipping keyboard integration")
+        log_info("No keyboard data available, skipping keyboard integration")
         return []
     
     # Common placeholder texts to filter out
@@ -3115,7 +4666,7 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
                 avg_words_per_minute = 0
                 avg_net_chars_per_minute = 0
             
-            description_parts = [f"{datetime_str} | keyboard | Typing Activity"]
+            description_parts = [f"keyboard | Typing Activity"]
             description_parts.append(f"    - Total typing sessions: {len(keyboard_descriptions)}")
             description_parts.append(f"    - Total keyboard events: {total_events}")
             
@@ -3219,7 +4770,7 @@ def describe_keyboard_integrated(sensor_data, sensor_name, start_timestamp, end_
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_keyboard_window_with_sessions
     )
     
-    print(f"Generated {len(narratives)} keyboard narratives with typing detection (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} keyboard narratives with typing detection (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def sort_narratives_by_time_window_and_sensor_order(all_narratives):
@@ -3233,10 +4784,13 @@ def sort_narratives_by_time_window_and_sensor_order(all_narratives):
     4. Engagement signals: screen, applications, keyboard, screentext
     
     Args:
-        all_narratives (list): List of (datetime_str, description) tuples
+        all_narratives (list): List of narrative dictionaries with keys:
+                              - unix_timestamp: Unix timestamp in milliseconds
+                              - sensor_type: Sensor type string
+                              - description: Human-readable narrative text
         
     Returns:
-        list: Sorted list of (datetime_str, description) tuples with category headers
+        list: Sorted list of narrative dictionaries with category headers
     """
     from collections import defaultdict
     
@@ -3248,6 +4802,7 @@ def sort_narratives_by_time_window_and_sensor_order(all_narratives):
         'bluetooth': 'environmental_context',
         # Communication events
         'notifications': 'communication_events',
+        'applications_notifications': 'communication_events',  # Added missing sensor type
         'calls': 'communication_events',
         'messages': 'communication_events',
         # Device state
@@ -3275,56 +4830,35 @@ def sort_narratives_by_time_window_and_sensor_order(all_narratives):
         'engagement_signals': 'Engagement Signals'
     }
     
-    def get_sensor_type(description):
-        """Extract sensor type from description."""
-        if ' | locations | ' in description:
-            return 'locations'
-        elif ' | wifi | ' in description:
-            return 'wifi'
-        elif ' | bluetooth | ' in description:
-            return 'bluetooth'
-        elif ' | notifications | ' in description:
-            return 'notifications'
-        elif ' | calls | ' in description:
-            return 'calls'
-        elif ' | messages | ' in description:
-            return 'messages'
-        elif ' | battery | ' in description:
-            return 'battery'
-        elif ' | installations | ' in description:
-            return 'installations'
-        elif ' | screen | ' in description:
-            return 'screen'
-        elif ' | applications | ' in description:
-            return 'applications'
-        elif ' | keyboard | ' in description:
-            return 'keyboard'
-        elif ' | screentext | ' in description:
-            return 'screentext'
-        else:
-            # For other sensors, assign a default high priority to appear after main sensors
-            return 'other'
+    def get_sensor_type(narrative_dict):
+        """Extract sensor type from narrative dictionary."""
+        return narrative_dict.get('sensor_type', 'other')
     
-    def get_sensor_category(description):
+    def get_sensor_category(narrative_dict):
         """Get category for sensor type."""
-        sensor_type = get_sensor_type(description)
+        sensor_type = get_sensor_type(narrative_dict)
         return sensor_categories.get(sensor_type, 'other')
     
-    def get_category_priority(description):
+    def get_category_priority(narrative_dict):
         """Get category priority for sorting."""
-        category = get_sensor_category(description)
+        category = get_sensor_category(narrative_dict)
         try:
             return category_order.index(category)
         except ValueError:
             return len(category_order)  # Put unknown categories at the end
     
-    # Group narratives by time window (datetime string)
+    # Group narratives by time window using unix timestamp
     time_window_groups = defaultdict(list)
     
-    for datetime_str, description in all_narratives:
-        time_window_groups[datetime_str].append((datetime_str, description))
+    for narrative_dict in all_narratives:
+        # Convert unix timestamp to datetime string for grouping compatibility
+        unix_ts = narrative_dict['unix_timestamp']
+        dt = pd.to_datetime(unix_ts, unit='ms', utc=True)
+        local_time = dt.tz_convert(timezone)
+        datetime_str = local_time.strftime('%Y-%m-%d %H:%M:%S')
+        time_window_groups[datetime_str].append(narrative_dict)
     
-    # Sort within each time window by category and create formatted output
+    # Sort within each time window by category priority and create formatted output
     sorted_narratives = []
     window_number = 1
     
@@ -3332,11 +4866,15 @@ def sort_narratives_by_time_window_and_sensor_order(all_narratives):
         window_narratives = time_window_groups[time_window]
         
         # Sort this window's narratives by category priority
-        window_narratives.sort(key=lambda x: get_category_priority(x[1]))
+        window_narratives.sort(key=lambda x: get_category_priority(x))
         
         # Add newline before time window (except for the first one)
         if sorted_narratives:
-            sorted_narratives.append((time_window, ""))
+            sorted_narratives.append({
+                'unix_timestamp': window_narratives[0]['unix_timestamp'],
+                'sensor_type': 'header',
+                'description': ""
+            })
         
         # Create time range header with window number and day information
         time_window_dt = pd.to_datetime(time_window)
@@ -3356,37 +4894,44 @@ def sort_narratives_by_time_window_and_sensor_order(all_narratives):
             time_range = f"{time_window_dt.strftime('%H:%M:%S')} - {next_window_dt.strftime('%H:%M:%S')}"
         
         time_range_header = f"Window {window_number}\n{day_info}\n{time_range}"
-        sorted_narratives.append((time_window, time_range_header))
+        sorted_narratives.append({
+            'unix_timestamp': window_narratives[0]['unix_timestamp'],
+            'sensor_type': 'header',
+            'description': time_range_header
+        })
         
         window_number += 1
         
         # Group by category and add headers
         current_category = None
-        for datetime_str, description in window_narratives:
-            category = get_sensor_category(description)
+        for narrative_dict in window_narratives:
+            category = get_sensor_category(narrative_dict)
             
             # Add category header if this is a new category
             if category != current_category and category in category_display_names:
                 current_category = category
                 # Add newline before category header
-                sorted_narratives.append((time_window, ""))
+                sorted_narratives.append({
+                    'unix_timestamp': narrative_dict['unix_timestamp'],
+                    'sensor_type': 'header',
+                    'description': ""
+                })
                 category_header = category_display_names[category]
-                sorted_narratives.append((time_window, category_header))
+                sorted_narratives.append({
+                    'unix_timestamp': narrative_dict['unix_timestamp'],
+                    'sensor_type': 'header',
+                    'description': category_header
+                })
             
-            # Remove timestamp prefix from description and add dash prefix
-            if ' | ' in description:
-                # Extract the part after the timestamp
-                description_parts = description.split(' | ', 2)
-                if len(description_parts) >= 3:
-                    sensor_type = description_parts[1]
-                    content = description_parts[2]
-                    formatted_description = f"- {sensor_type} | {content}"
-                else:
-                    formatted_description = f"- {description}"
-            else:
-                formatted_description = f"- {description}"
+            # Add dash prefix to description (description already contains sensor type)
+            description = narrative_dict['description']
+            formatted_description = f"- {description}"
             
-            sorted_narratives.append((time_window, formatted_description))
+            sorted_narratives.append({
+                'unix_timestamp': narrative_dict['unix_timestamp'],
+                'sensor_type': narrative_dict['sensor_type'],
+                'description': formatted_description
+            })
     
     return sorted_narratives
 
@@ -3403,12 +4948,15 @@ def describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_ti
         sessions (list, optional): List of session records for session correlation
         
     Returns:
-        list: List of formatted screen narrative tuples (datetime, description)
+        list: List of formatted screen narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('screen')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for screen")
+    log_info("Generating integrated description for screen")
     
     if sensor_name != "screen" or not sensor_data:
-        print("No screen data available, skipping screen integration")
+        log_info("No screen data available, skipping screen integration")
         return []
     
     # Screen status mapping
@@ -3528,6 +5076,7 @@ def describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_ti
             current_session['end_status'] = pending_off_event['status']
             current_session['duration_seconds'] = (pending_off_event['timestamp'] - current_session['start_timestamp']) / 1000.0
             screen_sessions.append(current_session)
+            current_session = None  # Mark as finalized
         
         # If there's an unclosed session, it's ongoing
         if current_session is not None:
@@ -3546,7 +5095,7 @@ def describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_ti
                 activation_intervals.append(interval)
         
         # Generate description
-        description_parts = [f"{datetime_str} | screen | Screen Status Analysis"]
+        description_parts = [f"screen | Screen Status Analysis"]
         
         # Show event breakdown (all event types including locked/unlocked)
         if status_counts:
@@ -3555,8 +5104,8 @@ def describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_ti
                 event_breakdown.append(f"{count} {status}")
             description_parts.append(f"    - Event breakdown: {', '.join(event_breakdown)}")
         
-        # Screen session information (exclude carryover sessions from activation count)
-        new_activations = len([s for s in screen_sessions if not s.get('is_carryover', False)])
+        # Screen session information (count only sessions that started in this window)
+        new_activations = len([s for s in screen_sessions if not s.get('is_carryover', False) and s['start_timestamp'] >= window_start])
         if screen_sessions:
             description_parts.append(f"    - Screen activations: {new_activations}")
             
@@ -3648,49 +5197,20 @@ def describe_screen_integrated(sensor_data, sensor_name, start_timestamp, end_ti
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_screen_window
     )
     
-    print(f"Generated {len(narratives)} screen narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} screen narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
-"""
-IMPROVED MULTI-DAY HOME DETECTION APPROACH
-
-This implementation addresses the limitations of the original approach by:
-
-1. **Daily Home Candidate Identification**: For each day, identifies the most frequent nighttime cluster
-2. **Proximity-Based Merging**: Merges daily candidates that are within merge_distance_threshold of each other
-3. **Robust Home Detection**: Uses the merged location as the true home
-4. **Daily Analysis**: Provides insights into which days the user was actually home
-
-Example scenario:
-- Day 1: User's home GPS reads (lat: -37.8136, lon: 144.9631) - Cluster 0
-- Day 2: User's home GPS reads (lat: -37.8138, lon: 144.9629) - Cluster 3  
-- Day 3: User stays at friend's house (lat: -37.8200, lon: 144.9500) - Cluster 7
-- Day 4: User's home GPS reads (lat: -37.8135, lon: 144.9633) - Cluster 10
-
-Results:
-- Day 1, 2, 4 candidates are within merge_distance_threshold → merged as "home"
-- Day 3 candidate is >500m away → identified as "away from home"
-- Final home location: weighted average of Days 1, 2, 4 coordinates
-
-Benefits:
-- Handles GPS drift and daily clustering variations
-- Detects when user wasn't home on specific days
-- Provides daily home presence analysis
-- More robust than single-pass nighttime frequency analysis
-"""
-
-def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluster_labels, datetimes, night_time_start, night_time_end, merge_distance_threshold=50):
+# Do not remove this function, it is used for post-clustering home candidate analysis
+def identify_and_merge_daily_home_candidates(daily_clusters, night_time_start, night_time_end, merge_distance_threshold, logger=None):
     """
     Identify home cluster candidates for each day and merge nearby candidates.
     
     Args:
         daily_clusters: Dictionary containing daily clustering results
-        coordinates: All clustered coordinates
-        cluster_labels: All cluster labels
-        datetimes: All datetime strings
         night_time_start: Start hour of nighttime (e.g., 22 for 10 PM)
         night_time_end: End hour of nighttime (e.g., 6 for 6 AM)
         merge_distance_threshold: Distance threshold in meters to merge candidates
+        logger: Logger instance for detailed logging
         
     Returns:
         tuple: (home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge)
@@ -3698,7 +5218,7 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
     daily_home_candidates = {}
     days_without_nighttime = []
     
-    print("\n=== Daily Home Candidate Analysis ===")
+    log_info("\n=== Daily Home Candidate Analysis ===", logger)
     
     # Step 1: Identify home cluster candidate for each day
     for day_id, day_data in daily_clusters.items():
@@ -3738,17 +5258,17 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
                 'total_points_in_candidate': np.sum(candidate_mask)
             }
             
-            print(f"Day {day_id}: Home candidate cluster {day_home_candidate} at ({candidate_center[0]:.6f}, {candidate_center[1]:.6f})")
-            print(f"  - {len(day_night_labels)} nighttime points, {np.sum(day_night_labels == day_home_candidate)} in candidate cluster")
+            log_info(f"Day {day_id}: Home candidate cluster {day_home_candidate} at ({candidate_center[0]:.6f}, {candidate_center[1]:.6f})", logger)
+            log_info(f"  - {len(day_night_labels)} nighttime points, {np.sum(day_night_labels == day_home_candidate)} in candidate cluster", logger)
         else:
-            print(f"Day {day_id}: No nighttime points found - will check for home proximity after finding merged home")
+            log_info(f"Day {day_id}: No nighttime points found - will check for home proximity after finding merged home", logger)
             days_without_nighttime.append(day_id)
     
     if not daily_home_candidates:
         raise ValueError("No daily home candidates found")
     
     # Step 2: Calculate distances between daily home candidates
-    print("\n=== Merging Nearby Home Candidates ===")
+    log_info("\n=== Merging Nearby Home Candidates ===", logger)
     candidate_centers = []
     candidate_days = []
     
@@ -3783,7 +5303,7 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
                 group['centers'].append(center_j)
                 group['candidates'].append(daily_home_candidates[candidate_days[j]])
                 used_candidates.add(j)
-                print(f"Merging Day {candidate_days[j]} candidate with Day {candidate_days[i]} (distance: {distance:.1f}m)")
+                log_info(f"Merging Day {candidate_days[j]} candidate with Day {candidate_days[i]} (distance: {distance:.1f}m)", logger)
         
         candidate_groups.append(group)
     
@@ -3799,19 +5319,19 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
     else:
         merged_home_center = np.mean(primary_group['centers'], axis=0)
     
-    print(f"\nPrimary home group: {len(primary_group['days'])} days")
-    print(f"Days with home activity: {sorted(primary_group['days'])}")
-    print(f"Merged home center: ({merged_home_center[0]:.6f}, {merged_home_center[1]:.6f})")
+    log_info(f"\nPrimary home group: {len(primary_group['days'])} days", logger)
+    log_info(f"Days with home activity: {sorted(primary_group['days'])}", logger)
+    log_info(f"Merged home center: ({merged_home_center[0]:.6f}, {merged_home_center[1]:.6f})", logger)
     
     # Step 4: Collect all cluster IDs that should be merged
     clusters_to_merge = set()
     for candidate in primary_group['candidates']:
         clusters_to_merge.add(candidate['cluster_id'])
     
-    print(f"Clusters to merge: {sorted(list(clusters_to_merge))}")
+    log_info(f"Clusters to merge: {sorted(list(clusters_to_merge))}", logger)
     
     # Step 5: Check days without nighttime points for clusters that could be merged to home
-    print("\n=== Checking Days Without Nighttime Points ===")
+    log_info("\n=== Checking Days Without Nighttime Points ===", logger)
     for day_id in days_without_nighttime:
         day_data = daily_clusters[day_id]
         day_labels = day_data['labels']
@@ -3830,10 +5350,10 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
             distance_to_home = geodesic(cluster_center, merged_home_center).meters
             
             if distance_to_home <= merge_distance_threshold:
-                print(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - merging")
+                log_info(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - merging", logger)
                 clusters_to_merge.add(cluster_id)
             else:
-                print(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - not merging")
+                log_info(f"Day {day_id}: Cluster {cluster_id} at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f}) is {distance_to_home:.1f}m from home - not merging", logger)
     
     # Step 6: Find the best representative cluster ID (most nighttime points)
     best_candidate = max(primary_group['candidates'], key=lambda c: c['nighttime_points_in_candidate'])
@@ -3931,23 +5451,23 @@ def identify_and_merge_daily_home_candidates(daily_clusters, coordinates, cluste
             }
     
     # Print daily analysis
-    print("\n=== Daily Home Presence Analysis ===")
+    log_info("\n=== Daily Home Presence Analysis ===", logger)
     for day_id in sorted(daily_home_analysis.keys()):
         analysis = daily_home_analysis[day_id]
         if analysis['was_home']:
             if analysis.get('merged_to_home', False):
-                print(f"Day {day_id}: At home (merged to home cluster, {analysis['distance_from_home']:.1f}m from home center)")
+                log_info(f"Day {day_id}: At home (merged to home cluster, {analysis['distance_from_home']:.1f}m from home center)", logger)
             else:
-                print(f"Day {day_id}: At home ({analysis['nighttime_points_at_home']}/{analysis['nighttime_points']} nighttime points, {analysis['home_percentage']:.1f}%)")
+                log_info(f"Day {day_id}: At home ({analysis['nighttime_points_at_home']}/{analysis['nighttime_points']} nighttime points, {analysis['home_percentage']:.1f}%)", logger)
         elif analysis.get('alternative_location', False):
-            print(f"Day {day_id}: Away from home ({analysis['distance_from_home']:.1f}m from home, {analysis['nighttime_points']} nighttime points)")
+            log_info(f"Day {day_id}: Away from home ({analysis['distance_from_home']:.1f}m from home, {analysis['nighttime_points']} nighttime points)", logger)
         else:
-            print(f"Day {day_id}: No clear nighttime location")
+            log_info(f"Day {day_id}: No clear nighttime location", logger)
     
     return home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge
 
 def process_clustering_results(coordinates, cluster_labels, datetimes, indices, speeds, 
-                               use_daily_clustering, daily_clusters, night_time_start, night_time_end):
+                               use_daily_clustering, daily_clusters, night_time_start, night_time_end, logger=None):
     """
     Process clustering results to identify home cluster, build cluster data structure,
     and calculate distances. This function handles common post-clustering steps for both
@@ -3963,6 +5483,7 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         daily_clusters: Dictionary of daily clustering results (for multi-day)
         night_time_start: Start hour of nighttime period
         night_time_end: End hour of nighttime period
+        logger: Logger instance for detailed logging
         
     Returns:
         tuple: (cluster, clustered_coordinates, clustered_labels, clustered_datetimes, 
@@ -3980,20 +5501,15 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
     clustered_indices = [indices[i] for i in range(len(indices)) if mask[i]]
     clustered_speeds = [speeds[i] for i in range(len(speeds)) if mask[i]]
     
-    print(f"After filtering noise: {len(clustered_labels)} clustered points")
+    log_info(f"After filtering noise: {len(clustered_labels)} clustered points", logger)
     
     # Identify home cluster using appropriate method
     if use_daily_clustering and daily_clusters:
         # Use daily home candidate merging approach
         home_cluster_index, daily_home_analysis, merged_home_center, clusters_to_merge = identify_and_merge_daily_home_candidates(
-            daily_clusters, clustered_coordinates, clustered_labels, clustered_datetimes,
-            night_time_start, night_time_end, merge_distance_threshold
+            daily_clusters, night_time_start, night_time_end, merge_distance_threshold, logger
         )
-        
-        # Store daily analysis for potential use in narratives
-        globals()['daily_home_analysis'] = daily_home_analysis
-        
-        # Note: Merging and renumbering will be done together in the next step for efficiency
+
             
     else:
         # Use original method for single day or short periods
@@ -4010,9 +5526,9 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         if len(night_labels) == 0:
             raise ValueError("No nighttime data available for home cluster identification")
         
-        print(f"Found {len(night_labels)} nighttime location points in valid clusters")
+        log_info(f"Found {len(night_labels)} nighttime location points in valid clusters", logger)
         home_cluster_index = np.bincount(night_labels).argmax() # Identify home cluster
-        print(f"Home cluster identified as cluster {home_cluster_index}")
+        log_info(f"Home cluster identified as cluster {home_cluster_index}", logger)
         merged_home_center = None
         clusters_to_merge = set()
         
@@ -4025,15 +5541,15 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
     # Set home_group_center before processing clusters
     if merged_home_center is not None:
         home_group_center = merged_home_center
-        print(f"Using merged home center: ({merged_home_center[0]:.6f}, {merged_home_center[1]:.6f})")
+        log_info(f"Using merged home center: ({merged_home_center[0]:.6f}, {merged_home_center[1]:.6f})", logger)
     else:
         # For single-day clustering, we'll set this when we find the home cluster
         home_group_center = None
-        print("Will determine home center from home cluster centroid")
+        log_info("Will determine home center from home cluster centroid", logger)
     
     # COMBINED MERGING AND RENUMBERING IN SINGLE OPERATION
     # This efficiently merges home candidates and assigns final consecutive IDs in one pass
-    print("\n=== Combined Merging and Renumbering Operation ===")
+    log_info("\n=== Combined Merging and Renumbering Operation ===", logger)
     unique_cluster_ids = sorted(set(clustered_labels))
     
     # Create direct mapping from original cluster IDs to final consecutive IDs
@@ -4041,43 +5557,43 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
     
     if use_daily_clustering and daily_clusters and 'clusters_to_merge' in locals():
         # Multi-day clustering: merge home candidates to ID 0, others get consecutive IDs
-        print(f"Merging home candidates {sorted(list(clusters_to_merge))} → ID 0")
+        log_info(f"Merging home candidates {sorted(list(clusters_to_merge))} → ID 0", logger)
         
         # All home candidate clusters map to ID 0
         for cluster_id in clusters_to_merge:
             old_to_new_mapping[cluster_id] = 0
-            print(f"  - Home candidate cluster {cluster_id} → 0")
+            log_info(f"  - Home candidate cluster {cluster_id} → 0", logger)
         
         # Assign consecutive IDs to non-home clusters
         new_cluster_id = 1
         for old_cluster_id in unique_cluster_ids:
             if old_cluster_id not in clusters_to_merge:
                 old_to_new_mapping[old_cluster_id] = new_cluster_id
-                print(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}")
+                log_info(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}", logger)
                 new_cluster_id += 1
         
         home_cluster_index = 0  # Merged home cluster is always ID 0
         
     else:
         # Single-day clustering: home cluster to ID 0, others get consecutive IDs
-        print(f"Single home cluster {home_cluster_index} → ID 0")
+        log_info(f"Single home cluster {home_cluster_index} → ID 0", logger)
         
         # Home cluster gets ID 0
         old_to_new_mapping[home_cluster_index] = 0
-        print(f"  - Home cluster {home_cluster_index} → 0")
+        log_info(f"  - Home cluster {home_cluster_index} → 0", logger)
         
         # Assign consecutive IDs to other clusters
         new_cluster_id = 1
         for old_cluster_id in unique_cluster_ids:
             if old_cluster_id != home_cluster_index:
                 old_to_new_mapping[old_cluster_id] = new_cluster_id
-                print(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}")
+                log_info(f"  - Unknown cluster {old_cluster_id} → {new_cluster_id}", logger)
                 new_cluster_id += 1
         
         home_cluster_index = 0  # Home cluster is always ID 0
     
     # Apply the mapping in a single pass through all points
-    print(f"Applying final cluster assignments to {len(clustered_labels)} points...")
+    log_info(f"Applying final cluster assignments to {len(clustered_labels)} points...", logger)
     final_labels = clustered_labels.copy()
     merged_point_count = 0
     
@@ -4090,30 +5606,13 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
     clustered_labels = final_labels
     
     final_cluster_count = len(set(clustered_labels))
-    print(f"✓ Final result: {final_cluster_count} clusters (Home: {merged_point_count} points, Unknown: {len(clustered_labels) - merged_point_count} points)")
+    log_info(f"✓ Final result: {final_cluster_count} clusters (Home: {merged_point_count} points, Unknown: {len(clustered_labels) - merged_point_count} points)", logger)
     
     # Set merged_home_center for distance calculations
     if use_daily_clustering and daily_clusters and 'clusters_to_merge' in locals() and len(clusters_to_merge) > 1:
         merged_home_center = merged_home_center  # Use the calculated merged center
     else:
         merged_home_center = None  # Will use cluster center
-
-    """
-    CLUSTER DISTANCE CALCULATION FIX WITH UNIQUE UNKNOWN PLACE LABELING:
-    
-    Issue: All non-home clusters were labeled as "unknown", making them indistinguishable.
-    
-    Fix:
-    1. Set home_group_center properly before cluster processing
-    2. For home cluster: Use "home" label and store merged/cluster center coordinates
-    3. For other clusters: Use unique labels "unknown1", "unknown2", etc. based on their new IDs
-    4. Calculate ALL distances using the same home_group_center reference point
-    
-    Result:
-    - Home cluster: labeled as "home", distance = 0m
-    - Other clusters: labeled as "unknown1", "unknown2", etc. with accurate distances
-    - Each unknown place gets a unique, meaningful identifier
-    """
     
     cluster = []
     unknown_place_counter = 0
@@ -4136,18 +5635,18 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
             if merged_home_center is not None:
                 actual_center = merged_home_center
                 home_group_center = merged_home_center  # Ensure it's set for distance calculations
-                print(f"Home cluster {cluster_id}: Using merged center ({actual_center[0]:.6f}, {actual_center[1]:.6f}) vs cluster center ({cluster_center[0]:.6f}, {cluster_center[1]:.6f})")
+                log_info(f"Home cluster {cluster_id}: Using merged center ({actual_center[0]:.6f}, {actual_center[1]:.6f}) vs cluster center ({cluster_center[0]:.6f}, {cluster_center[1]:.6f})", logger)
             else:
                 actual_center = cluster_center
                 home_group_center = cluster_center  # Set for single-day clustering
-                print(f"Home cluster {cluster_id}: Using cluster center ({actual_center[0]:.6f}, {actual_center[1]:.6f})")
+                log_info(f"Home cluster {cluster_id}: Using cluster center ({actual_center[0]:.6f}, {actual_center[1]:.6f})", logger)
             
             cluster.append((int(cluster_id), float(actual_center[0]), float(actual_center[1]), int(len(cluster_points)), place))
         else:
             # Generate unique unknown place labels: unknown1, unknown2, unknown3, etc.
             unknown_place_counter += 1
             place = f"unknown{unknown_place_counter}"
-            print(f"Unknown cluster {cluster_id}: Labeled as '{place}' at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f})")
+            log_info(f"Unknown cluster {cluster_id}: Labeled as '{place}' at ({cluster_center[0]:.6f}, {cluster_center[1]:.6f})", logger)
             
             # For non-home clusters, use the calculated cluster center
             cluster.append((int(cluster_id), float(cluster_center[0]), float(cluster_center[1]), int(len(cluster_points)), place))
@@ -4156,7 +5655,7 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
     if home_group_center is None:
         raise ValueError("home_group_center not properly set - this should not happen")
     
-    print(f"Calculating distances from home center: ({home_group_center[0]:.6f}, {home_group_center[1]:.6f})")
+    log_info(f"Calculating distances from home center: ({home_group_center[0]:.6f}, {home_group_center[1]:.6f})", logger)
     
     for i, cluster_entry in enumerate(cluster):
         cluster_id, center_lat, center_lon, num_points, place = cluster_entry
@@ -4173,22 +5672,22 @@ def process_clustering_results(coordinates, cluster_labels, datetimes, indices, 
         if len(cluster_data) == 6:  # Must have exactly 6 elements
             cluster_id, center_lat, center_lon, num_points, place, cluster_distance_from_home = cluster_data
             if place == "home":
-                print(f"VALIDATION: Home cluster {cluster_id} distance from home: {cluster_distance_from_home:.1f}m (should be ~0 for merged center)")
+                log_info(f"VALIDATION: Home cluster {cluster_id} distance from home: {cluster_distance_from_home:.1f}m (should be ~0 for merged center)", logger)
                 break
 
     # Print cluster details
     if len(clustered_coordinates) > 0:
-        print("Cluster Centers:")
+        log_info("Cluster Centers:", logger)
         for cluster_data in cluster:
             if len(cluster_data) == 6:  # Must have exactly 6 elements
                 cluster_id, center_lat, center_lon, num_points, place, distance_from_home = cluster_data
-                print(f"Cluster {cluster_id}: Center Lat = {center_lat:.6f}, Center Lon = {center_lon:.6f}, N = {num_points}, Place = {place}, Distance = {distance_from_home:.1f}m")
+                log_info(f"Cluster {cluster_id}: Center Lat = {center_lat:.6f}, Center Lon = {center_lon:.6f}, N = {num_points}, Place = {place}, Distance = {distance_from_home:.1f}m", logger)
 
     return (cluster, clustered_coordinates, clustered_labels, clustered_datetimes, 
             clustered_indices, clustered_speeds, home_group_center)
 
 def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_daily_clustering, 
-                               start_dt, end_dt, night_time_end):
+                               start_dt, end_dt, night_time_end, logger=None):
     """
     Perform DBSCAN clustering using either single-day or multi-day approach.
     
@@ -4201,13 +5700,14 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
         start_dt: Start datetime object
         end_dt: End datetime object  
         night_time_end: Hour when daily periods end
+        logger: Logger instance for detailed logging
         
     Returns:
         tuple: (cluster_labels, daily_clusters)
     """
     
     if use_daily_clustering:
-        print("Performing multi-day clustering...")
+        log_info("Performing multi-day clustering...", logger)
         
         # Group data by daily periods starting from night_time_end
         daily_clusters = {}
@@ -4240,7 +5740,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
         
         # Check if last day is less than 24 hours and combine with previous day if needed
         if len(daily_periods) > 1 and daily_periods[-1]['duration_hours'] < 24:
-            print(f"Last day has {daily_periods[-1]['duration_hours']:.1f} hours - combining with previous day")
+            log_info(f"Last day has {daily_periods[-1]['duration_hours']:.1f} hours - combining with previous day", logger)
             # Extend the previous day to include the last day
             daily_periods[-2]['end'] = daily_periods[-1]['end']
             daily_periods[-2]['duration_hours'] = (daily_periods[-2]['end'] - daily_periods[-2]['start']).total_seconds() / 3600
@@ -4267,7 +5767,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
                     daily_datetimes.append(dt_str)
             
             if len(daily_coordinates) >= min_samples:
-                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points")
+                log_info(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points", logger)
                 
                 # Perform clustering for this day
                 daily_coordinates = np.array(daily_coordinates)
@@ -4313,7 +5813,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
                             all_cluster_labels.append(-1)
                         all_cluster_labels[global_idx] = adjusted_labels[i]
             else:
-                print(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points (insufficient for clustering)")
+                log_info(f"Day {day_counter}: {period_start.strftime('%Y-%m-%d %H:%M:%S')} to {period_end.strftime('%Y-%m-%d %H:%M:%S')} ({duration_hours:.1f}h) - {len(daily_coordinates)} points (insufficient for clustering)", logger)
             
             day_counter += 1
         
@@ -4323,7 +5823,7 @@ def perform_dbscan_clustering(coordinates, datetimes, eps, min_samples, use_dail
         cluster_labels = np.array(all_cluster_labels[:len(coordinates)])
         
     else:
-        print("Performing single-day clustering...")
+        log_info("Performing single-day clustering...", logger)
         
         # Use all data for clustering (original behavior)
         # Convert coordinates to radians for haversine metric
@@ -4438,8 +5938,6 @@ def calculate_location_stay_times_from_timestamps(sorted_data, window_start, win
     
     # Merge periods for locations that will remain, accounting for filtered locations
     if locations_to_filter:
-        #print(f"Will filter out locations: {', '.join(locations_to_filter)}") #Uncomment to see the locations that are being filtered out
-        
         # For each location that will remain, merge its periods if there are filtered locations between them
         for place_name, stats in location_visits.items():
             if place_name not in locations_to_filter and len(stats['visit_periods']) > 1:
@@ -4473,16 +5971,6 @@ def calculate_location_stay_times_from_timestamps(sorted_data, window_start, win
             filtered_location_visits[place_name] = stats
         else:
             filtered_count += 1
-
-    #Uncomment to see the locations that are being filtered out
-            # if stats['data_points'] < location_minimum_data_points:
-            #     print(f"Filtering out location '{place_name}' with only {stats['data_points']} data points (threshold: {location_minimum_data_points})")
-            # elif stats['total_time_seconds'] < (location_minimum_stay_minutes * 60):
-            #     print(f"Filtering out location '{place_name}' with only {stats['total_time_seconds']:.1f}s stay time (minimum: {location_minimum_stay_minutes} minutes)")
-    
-    #Uncomment to see the number of locations that are being filtered out
-    # if filtered_count > 0:
-    #     print(f"Filtered out {filtered_count} locations with insufficient data points or stay time")
     
     # Convert to minutes for remaining locations and filter out data quality issues
     final_location_visits = {}
@@ -4490,11 +5978,10 @@ def calculate_location_stay_times_from_timestamps(sorted_data, window_start, win
         total_seconds = stats['total_time_seconds']
         
         # With multiple data points, we should always have a valid time span
-        # If total_seconds is 0, it indicates a data quality issue (same timestamps)
         if total_seconds <= 0:
-            print(f"Warning: Location '{place_name}' has {stats['data_points']} data points but zero time span - possible data quality issue")
-            print(f"  Visit periods: {stats.get('visit_periods', [])}")
-            print(f"  Skipping location due to zero time span")
+            log_warning(f"Warning: Location '{place_name}' has {stats['data_points']} data points but zero time span - possible data quality issue")
+            log_warning(f"  Visit periods: {stats.get('visit_periods', [])}")
+            log_warning(f"  Skipping location due to zero time span")
             continue
         else:
             stats['estimated_time_seconds'] = total_seconds
@@ -4529,10 +6016,10 @@ def describe_messages_integrated(sensor_data, sensor_name, start_timestamp, end_
     Returns:
         list: List of formatted messages narrative tuples (datetime, description)
     """
-    print("Generating integrated description for messages")
+    log_info("Generating integrated description for messages")
     
     if sensor_name != "messages" or not sensor_data:
-        print("No messages data available, skipping messages integration")
+        log_info("No messages data available, skipping messages integration")
         return []
     
     # Message type mapping
@@ -4601,7 +6088,7 @@ def describe_messages_integrated(sensor_data, sensor_name, start_timestamp, end_
             total_messages += 1
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | messages | Messaging Activity"]
+        description_parts = [f"messages | Messaging Activity"]
         
         # Show total messages summary
         if total_messages > 0:
@@ -4669,7 +6156,7 @@ def describe_messages_integrated(sensor_data, sensor_name, start_timestamp, end_
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_messages_window
     )
     
-    print(f"Generated {len(narratives)} messages narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} messages narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 
@@ -4734,12 +6221,15 @@ def describe_calls_integrated(sensor_data, sensor_name, start_timestamp, end_tim
         sessions (list, optional): List of session records for session correlation
         
     Returns:
-        list: List of formatted calls narrative tuples (datetime, description)
+        list: List of formatted calls narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('calls')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for calls")
+    log_info("Generating integrated description for calls")
     
     if sensor_name != "calls" or not sensor_data:
-        print("No calls data available, skipping calls integration")
+        log_info("No calls data available, skipping calls integration")
         return []
     
     # Call type mapping
@@ -4814,7 +6304,7 @@ def describe_calls_integrated(sensor_data, sensor_name, start_timestamp, end_tim
             total_duration += call_duration
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | calls | Call Activity"]
+        description_parts = [f"calls | Call Activity"]
         
         # Show total calls summary
         if total_calls > 0:
@@ -4911,7 +6401,7 @@ def describe_calls_integrated(sensor_data, sensor_name, start_timestamp, end_tim
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_calls_window
     )
     
-    print(f"Generated {len(narratives)} calls narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} calls narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timestamp, end_timestamp, sessions=None):
@@ -4927,12 +6417,15 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
         sessions (list, optional): List of session records (unused for wifi)
         
     Returns:
-        list: List of formatted wifi narrative tuples (datetime, description)
+        list: List of formatted wifi narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('wifi')
+              - description: Human-readable narrative text
     """
-    print("Generating combined integrated description for WiFi (connections + detections)")
+    log_info("Generating combined integrated description for WiFi (connections + detections)")
     
     if not sensor_wifi_data and not wifi_data:
-        print("No WiFi data available, skipping WiFi integration")
+        log_info("No WiFi data available, skipping WiFi integration")
         return []
     
     def process_wifi_combined_window(window_data_tuple, datetime_str, window_start, window_end):
@@ -4958,7 +6451,7 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
             return None
         
         # Build combined description
-        description_parts = [f"{datetime_str} | wifi | WiFi Activity Analysis"]
+        description_parts = [f"wifi | WiFi Activity Analysis"]
         
         # Add connection information
         if connection_info:
@@ -5071,7 +6564,7 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
             primary_ssid, primary_stats = None, None
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | wifi | WiFi Connection Activity"]
+        description_parts = [f"wifi | WiFi Connection Activity"]
         
         # Show total networks and connections
         total_networks = len(network_connections)
@@ -5207,7 +6700,7 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
         averaged_networks.sort(key=lambda x: x['avg_detections'], reverse=True)
         
         # Generate description for the window
-        description_parts = [f"{datetime_str} | wifi | WiFi Networks Detected"]
+        description_parts = [f"wifi | WiFi Networks Detected"]
         
         # Show average and range of unique networks (calculated from gate_time_window-min gate scans)
         if min_unique_networks == max_unique_networks:
@@ -5314,7 +6807,7 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
     
     # Process combined data using the shared helper function
     narratives = process_sensor_by_timewindow(
-        combined_data, "wifi_combined", start_timestamp, end_timestamp, process_wifi_combined_window_refactored
+        combined_data, "wifi", start_timestamp, end_timestamp, process_wifi_combined_window_refactored
     )
     
     sensor_types = []
@@ -5323,536 +6816,10 @@ def describe_wifi_combined_integrated(sensor_wifi_data, wifi_data, start_timesta
     if wifi_data:
         sensor_types.append("detections")
     
-    print(f"Generated {len(narratives)} combined WiFi narratives ({', '.join(sensor_types)}) (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} combined WiFi narratives ({', '.join(sensor_types)}) (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
-def process_network_state_window(network_window_data, datetime_str, window_start, window_end):
-    """Process network data to analyze WiFi and Mobile network connectivity patterns with airplane mode detection."""
-    if not network_window_data:
-        return None
-    
-    # Define network types with airplane mode detection
-    relevant_network_types = {
-        -1: "Airplane mode",
-        1: "WiFi network", 
-        4: "Mobile network"
-    }
-    
-    # Group by network type and process each type
-    network_types = {}
-    airplane_mode_active = False
-    
-    for record in network_window_data:
-        network_type = record.get('network_type')
-        network_subtype = record.get('network_subtype', 'UNKNOWN')
-        
-        # Only process relevant network types
-        if network_type not in relevant_network_types:
-            continue
-            
-        if network_type not in network_types:
-            network_types[network_type] = {
-                'subtype': network_subtype,
-                'display_name': relevant_network_types[network_type],
-                'records': []
-            }
-        network_types[network_type]['records'].append(record)
-        
-        # Check for airplane mode
-        if network_type == -1 and record.get('network_state') == 1:
-            airplane_mode_active = True
-    
-    # Process each network type and analyze patterns
-    all_results = []
-    final_network_candidates = []
-    network_periods = {}  # Store period information for pattern analysis
-    
-    for network_type, type_data in network_types.items():
-        subtype = type_data['subtype']
-        display_name = type_data['display_name']
-        records = type_data['records']
-        
-        if not records:
-            continue
-    
-        # Sort by timestamp
-        sorted_data = sorted(records, key=lambda x: x['timestamp'])
-        
-        # Analyze state transitions and create periods
-        state_periods = []
-        current_state = None
-        current_start = None
-        
-        for record in sorted_data:
-            network_state = record.get('network_state')
-            timestamp = record.get('timestamp')
-            record_datetime = record.get('datetime', datetime_str)
-            
-            if current_state is None:
-                # First record
-                current_state = network_state
-                current_start = timestamp
-                current_start_datetime = record_datetime
-            elif network_state != current_state:
-                # State change
-                state_periods.append({
-                    'state': current_state,
-                    'start_timestamp': current_start,
-                    'start_datetime': current_start_datetime,
-                    'end_timestamp': timestamp,
-                    'end_datetime': record_datetime,
-                    'duration_ms': timestamp - current_start
-                })
-                
-                current_state = network_state
-                current_start = timestamp
-                current_start_datetime = record_datetime
-        
-        # Add final period
-        if current_state is not None:
-            state_periods.append({
-                'state': current_state,
-                'start_timestamp': current_start,
-                'start_datetime': current_start_datetime,
-                'end_timestamp': window_end,
-                'end_datetime': datetime_str,
-                'duration_ms': window_end - current_start
-            })
-        
-        # Store periods for pattern analysis
-        network_periods[network_type] = state_periods
-        
-        # Generate description for this network type
-        if not state_periods:
-            continue
-    
-        # Calculate total times
-        total_on_time = sum(period['duration_ms'] for period in state_periods if period['state'] == 1)
-        total_off_time = sum(period['duration_ms'] for period in state_periods if period['state'] == 0)
-        window_duration = window_end - window_start
-        
-        on_percentage = (total_on_time / window_duration) * 100 if window_duration > 0 else 0
-        off_percentage = (total_off_time / window_duration) * 100 if window_duration > 0 else 0
-        
-        # Format durations
-        def format_duration(ms):
-            if ms > 60000:
-                mins = int(ms / 60000)
-                secs = int((ms % 60000) / 1000)
-                if mins > 0 and secs > 0:
-                    return f"{mins} min {secs} sec"
-                elif mins > 0:
-                    return f"{mins} min"
-                else:
-                    return f"{secs} sec"
-            else:
-                return f"{int(ms / 1000)} sec"
-        
-        # Build description for this network type
-        type_description = []
-        
-        # Only show detailed information for WiFi network (type 1)
-        # Mobile network info will only appear in the pattern sequence
-        if network_type == 1:  # WiFi network only
-            # Show overall connection summary
-            if total_on_time > 0:
-                on_str = format_duration(total_on_time)
-                type_description.append(f"    - {display_name} ON time: {on_str} ({on_percentage:.1f}% of window)")
-            
-            if total_off_time > 0:
-                off_str = format_duration(total_off_time)
-                type_description.append(f"    - {display_name} OFF time: {off_str} ({off_percentage:.1f}% of window)")
-            
-            # Show state transitions if any
-            state_changes = len([p for p in state_periods if len(state_periods) > 1])
-            if state_changes > 1:
-                type_description.append(f"    - State changes: {state_changes - 1} transitions")
-                
-                # Show sequence of states with periods
-                if len(state_periods) <= 6:  # Only show sequence if not too long
-                    sequence = []
-                    for period in state_periods:
-                        state_label = "ON" if period['state'] == 1 else "OFF"
-                        duration = format_duration(period['duration_ms'])
-                        sequence.append(f"{state_label}({duration})")
-                    
-                    type_description.append(f"    - State sequence: {' → '.join(sequence)}")
-            
-            # Show WiFi usage periods with start/end times
-            wifi_on_periods = [p for p in state_periods if p['state'] == 1]
-            if wifi_on_periods:
-                type_description.append(f"    - WiFi usage periods:")
-                for i, period in enumerate(wifi_on_periods):
-                    start_time = pd.to_datetime(period['start_timestamp'], unit='ms', utc=True).tz_convert('Australia/Melbourne').strftime('%H:%M:%S')
-                    end_time = pd.to_datetime(period['end_timestamp'], unit='ms', utc=True).tz_convert('Australia/Melbourne').strftime('%H:%M:%S')
-                    duration = format_duration(period['duration_ms'])
-                    type_description.append(f"         - Period {i+1}: {start_time} to {end_time} ({duration})")
-        
-        # Track final state candidates
-        final_state = state_periods[-1]['state'] if state_periods else None
-        if final_state is not None:
-            final_state_label = "ON" if final_state == 1 else "OFF"
-            last_timestamp = sorted_data[-1].get('timestamp', 0)
-            
-            # Priority: Airplane mode highest, then WiFi, then Mobile
-            if network_type == -1:
-                priority = 3  # Airplane mode highest priority
-            elif network_type == 1:
-                priority = 2  # WiFi
-            else:
-                priority = 1  # Mobile
-            
-            final_network_candidates.append({
-                'network_type': network_type,
-                'subtype': subtype,
-                'display_name': display_name,
-                'final_state_label': final_state_label,
-                'last_timestamp': last_timestamp,
-                'priority': priority
-            })
-        
-        # Store result for this network type
-        all_results.extend(type_description)
-    
-    # Analyze disconnection patterns and airplane mode correlation
-    if airplane_mode_active:
-        # Check if WiFi/Mobile disconnections correlate with airplane mode
-        airplane_periods = network_periods.get(-1, [])
-        wifi_periods = network_periods.get(1, [])
-        mobile_periods = network_periods.get(4, [])
-        
-        # Find airplane mode ON periods
-        airplane_on_periods = [p for p in airplane_periods if p['state'] == 1]
-        
-        if airplane_on_periods:
-            all_results.append(f"    - Airplane mode detected during {len(airplane_on_periods)} period(s)")
-            
-            # Check if disconnections happen during airplane mode
-            disconnections_during_airplane = []
-            for airplane_period in airplane_on_periods:
-                airplane_start = airplane_period['start_timestamp']
-                airplane_end = airplane_period['end_timestamp']
-                
-                # Check WiFi disconnections during airplane mode
-                for wifi_period in wifi_periods:
-                    if (wifi_period['state'] == 0 and 
-                        wifi_period['start_timestamp'] >= airplane_start and 
-                        wifi_period['end_timestamp'] <= airplane_end):
-                        disconnections_during_airplane.append("WiFi")
-                
-                # Check Mobile disconnections during airplane mode
-                for mobile_period in mobile_periods:
-                    if (mobile_period['state'] == 0 and 
-                        mobile_period['start_timestamp'] >= airplane_start and 
-                        mobile_period['end_timestamp'] <= airplane_end):
-                        disconnections_during_airplane.append("Mobile")
-            
-            if disconnections_during_airplane:
-                unique_disconnections = list(set(disconnections_during_airplane))
-                all_results.append(f"    - Disconnections caused by airplane mode: {', '.join(unique_disconnections)}")
-    
-    # Generate network pattern summary (WiFi takes precedence over Mobile when both are ON)
-    if len(network_periods) > 1:
-        # Create combined pattern sequence based on actual network usage
-        wifi_periods = network_periods.get(1, [])
-        mobile_periods = network_periods.get(4, [])
-        airplane_periods = network_periods.get(-1, [])
-        
-        # Create timeline of network usage events
-        usage_events = []
-        
-        # Add airplane mode events (highest priority)
-        for period in airplane_periods:
-            if period['state'] == 1:  # Airplane mode ON
-                usage_events.append({
-                    'timestamp': period['start_timestamp'],
-                    'end_timestamp': period['end_timestamp'],
-                    'display_name': 'Airplane mode',
-                    'duration_ms': period['duration_ms'],
-                    'priority': 3
-                })
-        
-        # Determine network usage periods (WiFi takes precedence over Mobile)
-        # Create a timeline of all network state changes
-        all_state_changes = []
-        
-        for period in wifi_periods:
-            all_state_changes.append({
-                'timestamp': period['start_timestamp'],
-                'network_type': 1,
-                'state': period['state'],
-                'duration_ms': period['duration_ms']
-            })
-        
-        for period in mobile_periods:
-            all_state_changes.append({
-                'timestamp': period['start_timestamp'],
-                'network_type': 4,
-                'state': period['state'],
-                'duration_ms': period['duration_ms']
-            })
-        
-        # Sort by timestamp
-        all_state_changes.sort(key=lambda x: x['timestamp'])
-        
-        # Track current state of each network
-        current_wifi_state = 0
-        current_mobile_state = 0
-        
-        # Determine actual network usage at each time point
-        for i, change in enumerate(all_state_changes):
-            if change['network_type'] == 1:  # WiFi
-                current_wifi_state = change['state']
-            elif change['network_type'] == 4:  # Mobile
-                current_mobile_state = change['state']
-            
-            # Determine which network is actually being used
-            if current_wifi_state == 1:
-                # WiFi is ON - use WiFi (takes precedence)
-                active_network = 'WiFi network'
-                priority = 2
-            elif current_mobile_state == 1:
-                # Only Mobile is ON - use Mobile
-                active_network = 'Mobile network'
-                priority = 1
-            else:
-                # Both are OFF - no network
-                active_network = None
-                priority = 0
-            
-            # Add usage event if network is active
-            if active_network:
-                # Calculate duration until next state change or end of window
-                if i + 1 < len(all_state_changes):
-                    next_change_time = all_state_changes[i + 1]['timestamp']
-                    duration = next_change_time - change['timestamp']
-                else:
-                    duration = window_end - change['timestamp']
-                
-                # Only add if this represents a meaningful change in network usage
-                if not usage_events or usage_events[-1]['display_name'] != active_network:
-                    usage_events.append({
-                        'timestamp': change['timestamp'],
-                        'end_timestamp': change['timestamp'] + duration,
-                        'display_name': active_network,
-                        'duration_ms': duration,
-                        'priority': priority
-                    })
-                else:
-                    # Extend the duration of the current usage period
-                    usage_events[-1]['duration_ms'] += duration
-                    usage_events[-1]['end_timestamp'] = change['timestamp'] + duration
-        
-        # Sort usage events by timestamp
-        usage_events.sort(key=lambda x: x['timestamp'])
-        
-        # Create pattern summary with start times
-        if len(usage_events) > 0:
-            pattern_summary = []
-            for event in usage_events[:5]:  # Show up to 5 events
-                start_time = pd.to_datetime(event['timestamp'], unit='ms', utc=True).tz_convert('Australia/Melbourne').strftime('%H:%M:%S')
-                duration = format_duration(event['duration_ms'])
-                pattern_summary.append(f"{event['display_name']} ON({start_time}, {duration})")
-            
-            if len(usage_events) > 5:
-                pattern_summary.append("...")
-            
-            all_results.append(f"    - Network pattern sequence: {' → '.join(pattern_summary)}")
-
-    
-    # Generate final description
-    if not all_results:
-        return None
-    
-    description_parts = [f"{datetime_str} | wifi | WiFi Activity Analysis"]
-    description_parts.extend(all_results)
-    return '\n'.join(description_parts)
-
-
-
-def get_sensor_wifi_basic_analysis(window_data, datetime_str, window_start, window_end, has_network_state=False):
-    """Standalone function to analyze sensor_wifi data for a window - extracted from nested function."""
-    if not window_data:
-        return None
-    
-    # Sort window data by timestamp
-    sorted_data = sorted(window_data, key=lambda x: x['timestamp'])
-    
-    # Track wifi networks and connections
-    network_connections = {}
-    connection_sequence = []
-    connection_switches = 0
-    
-    # Process each wifi connection record
-    previous_ssid = None
-    current_connection = None
-    
-    for i, record in enumerate(sorted_data):
-        ssid = record.get('ssid', '')
-        timestamp = record.get('timestamp', 0)
-        record_datetime = record.get('datetime', datetime_str)
-        
-        # Clean up SSID display
-        if ssid == '':
-            display_ssid = '<unknown ssid>'
-        else:
-            # Strip quotes from SSID for display
-            display_ssid = ssid.strip('"')
-        
-        # Track network statistics
-        if ssid not in network_connections:
-            network_connections[ssid] = {
-                'display_name': display_ssid,
-                'connection_count': 0,
-                'first_seen': record_datetime,
-                'last_seen': record_datetime,
-                'connection_times': []
-            }
-        
-        network_connections[ssid]['connection_count'] += 1
-        network_connections[ssid]['last_seen'] = record_datetime
-        network_connections[ssid]['connection_times'].append(timestamp)
-        
-        # Track connection sequence and switches
-        if previous_ssid is None:
-            # First connection in window
-            current_connection = {
-                'ssid': ssid,
-                'display_name': display_ssid,
-                'start_time': record_datetime,
-                'start_timestamp': timestamp
-            }
-            connection_sequence.append(current_connection)
-        elif ssid != previous_ssid:
-            # Network switch detected
-            connection_switches += 1
-            
-            # End previous connection
-            if current_connection:
-                current_connection['end_time'] = record_datetime
-                current_connection['end_timestamp'] = timestamp
-                current_connection['duration_ms'] = timestamp - current_connection['start_timestamp']
-            
-            # Start new connection
-            current_connection = {
-                'ssid': ssid,
-                'display_name': display_ssid,
-                'start_time': record_datetime,
-                'start_timestamp': timestamp
-            }
-            connection_sequence.append(current_connection)
-        
-        previous_ssid = ssid
-    
-    # End the last connection if it exists
-    if current_connection and 'end_time' not in current_connection:
-        current_connection['end_time'] = current_connection['start_time']
-        current_connection['end_timestamp'] = current_connection['start_timestamp']
-        current_connection['duration_ms'] = 0
-    
-    # Calculate durations for connections
-    for connection in connection_sequence:
-        if 'duration_ms' not in connection:
-            connection['duration_ms'] = 0
-    
-    # Determine primary network (most connected to)
-    if network_connections:
-        primary_network = max(network_connections.items(), key=lambda x: x[1]['connection_count'])
-        primary_ssid, primary_stats = primary_network
-    else:
-        primary_ssid, primary_stats = None, None
-    
-    # Generate description for this window
-    description_parts = [f"{datetime_str} | wifi | WiFi Connection Activity"]
-    
-    # Show total networks and connections
-    total_networks = len(network_connections)
-    total_connections = sum(stats['connection_count'] for stats in network_connections.values())
-    
-    if total_networks == 1:
-        description_parts.append(f"    - Connected to {total_networks} network ({total_connections} connection events)")
-    else:
-        description_parts.append(f"    - Connected to {total_networks} networks ({total_connections} connection events)")
-    
-    # Show network switches
-    if connection_switches > 0:
-        description_parts.append(f"    - Network switches: {connection_switches}")
-    
-    # Show connection sequence if there are multiple connections or switches
-    if len(connection_sequence) > 1 or connection_switches > 0:
-        sequence_names = []
-        for connection in connection_sequence:
-            sequence_names.append(connection['display_name'])
-        
-        # Remove consecutive duplicates for cleaner display
-        simplified_sequence = []
-        for name in sequence_names:
-            if not simplified_sequence or simplified_sequence[-1] != name:
-                simplified_sequence.append(name)
-        
-        if len(simplified_sequence) > 1:
-            sequence_str = " → ".join(simplified_sequence)
-            description_parts.append(f"    - Connection sequence: {sequence_str}")
-    
-    # Show primary network details
-    if primary_stats:
-        display_name = primary_stats['display_name']
-        description_parts.append(f"    - Primary network: {display_name}")
-    
-    # Show all networks if multiple networks were used
-    if total_networks > 1:
-        description_parts.append(f"    - Networks used:")
-        
-        # Sort networks by connection count (descending)
-        sorted_networks = sorted(network_connections.items(), 
-                               key=lambda x: x[1]['connection_count'], 
-                               reverse=True)
-        
-        for ssid, stats in sorted_networks:
-            display_name = stats['display_name']
-            description_parts.append(f"         - {display_name}")
-    
-    # Connection pattern analysis - be honest about what we know vs. infer
-    window_duration_ms = window_end - window_start
-    
-    # What we can reliably measure: time between network switches
-    network_switch_durations = [conn for conn in connection_sequence if conn.get('duration_ms', 0) > 0]
-    
-    if len(connection_sequence) == 1:
-        # Single network connection event in this window
-        single_network = connection_sequence[0]['display_name']
-        description_parts.append(f"    - Connection pattern: {single_network}")
-        
-    elif len(network_switch_durations) > 0:
-        # Multiple networks - we can measure time between switches
-        total_switch_time_ms = sum(conn['duration_ms'] for conn in network_switch_durations)
-        
-        # Format switch time
-        if total_switch_time_ms > 60000:
-            switch_mins = int(total_switch_time_ms / 60000)
-            switch_secs = int((total_switch_time_ms % 60000) / 1000)
-            
-            if switch_mins > 0:
-                if switch_secs > 0:
-                    switch_str = f"{switch_mins} min {switch_secs} sec"
-                else:
-                    switch_str = f"{switch_mins} min"
-            else:
-                switch_str = f"{switch_secs} sec"
-        else:
-            switch_str = f"{int(total_switch_time_ms / 1000)} sec"
-        
-        description_parts.append(f"    - Time between network switches: {switch_str}")
-        
-        # Switch intervals and switching pattern removed as requested
-        
-    else:
-        # Multiple connection events but no measurable durations
-        description_parts.append(f"    - Connection pattern: Multiple events with rapid switches (durations too short to measure)")
-     
-    return '\n'.join(description_parts)
-
-def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
+def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None, pid=None):
     """
     Generate integrated screentext analysis by time windows.
     Loads screentext data from the config file and processes screen text logs and app usage durations.
@@ -5869,18 +6836,21 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
         sessions (list, optional): List of original session records for session correlation
         
     Returns:
-        list: List of formatted screentext narrative tuples (datetime, description)
+        list: List of formatted screentext narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('screentext')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for screentext")
+    log_info("Generating integrated description for screentext")
     
     if sensor_name != "screentext":
-        print("Invalid sensor name for screentext integration")
+        log_info("Invalid sensor name for screentext integration")
         return []
     
     # Load screentext data from config file
-    cleaned_screentext_file = CONFIG.get("cleaned_screentext_file", "").format(P_ID=P_ID)
+    cleaned_screentext_file = CONFIG.get("cleaned_screentext_file", "").format(P_ID=pid)
     if not cleaned_screentext_file or not os.path.exists(cleaned_screentext_file):
-        print(f"Screentext file not found: {cleaned_screentext_file}")
+        log_info(f"Screentext file not found: {cleaned_screentext_file}")
         return []
     
     # Load and parse screentext data
@@ -5901,11 +6871,11 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
                     except json.JSONDecodeError:
                         continue
     except Exception as e:
-        print(f"Error loading screentext data: {e}")
+        log_error(f"Error loading screentext data: {e}")
         return []
     
     if not screentext_records:
-        print("No screentext records found")
+        log_info("No screentext records found")
         return []
     
     # Filter records within the time range and add timestamp field
@@ -5930,7 +6900,7 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
             continue
     
     if not filtered_records:
-        print("No screentext records in time range")
+        log_info("No screentext records in time range")
         return []
     
     def process_screentext_window(window_data, datetime_str, window_start, window_end):
@@ -5999,7 +6969,7 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
             return None
         
         # Generate description
-        description_parts = [f"{datetime_str} | screentext | Tracked Logs"]
+        description_parts = [f"screentext | Tracked Logs"]
         
         # Format total screen time
         if total_screen_time >= 3600:
@@ -6071,12 +7041,7 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
                 if (session['start_timestamp'] <= window_end and 
                     session['end_timestamp'] >= window_start):
                     overlapping_sessions.append(session['session_id'])
-            
-            if overlapping_sessions:
-                if len(overlapping_sessions) == 1:
-                    description_parts.append(f"    - Session activity: Session {overlapping_sessions[0]}")
-                else:
-                    description_parts.append(f"    - Session activity: Sessions {', '.join(map(str, overlapping_sessions))}")
+
         
         return '\n'.join(description_parts)
     
@@ -6085,7 +7050,7 @@ def describe_screentext_integrated(sensor_data, sensor_name, start_timestamp, en
         filtered_records, sensor_name, start_timestamp, end_timestamp, process_screentext_window
     )
     
-    print(f"Generated {len(narratives)} screentext narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} screentext narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
 def describe_installations_integrated(sensor_data, sensor_name, start_timestamp, end_timestamp, sessions=None):
@@ -6101,12 +7066,15 @@ def describe_installations_integrated(sensor_data, sensor_name, start_timestamp,
         sessions (list, optional): List of session records for session correlation
         
     Returns:
-        list: List of formatted installations narrative tuples (datetime, description)
+        list: List of formatted installations narrative dictionaries with keys:
+              - unix_timestamp: Unix timestamp in milliseconds
+              - sensor_type: Sensor type ('installations')
+              - description: Human-readable narrative text
     """
-    print("Generating integrated description for installations")
+    log_info("Generating integrated description for installations")
     
     if sensor_name != "installations" or not sensor_data:
-        print("No installations data available, skipping installations integration")
+        log_info("No installations data available, skipping installations integration")
         return []
     
     # Installation status mapping
@@ -6172,7 +7140,7 @@ def describe_installations_integrated(sensor_data, sensor_name, start_timestamp,
             return None
         
         # Generate description for this window
-        description_parts = [f"{datetime_str} | installations | App Installation Activity"]
+        description_parts = [f"installations | App Installation Activity"]
         
         # Show total activities summary
         description_parts.append(f"    - Total activities: {total_activities}")
@@ -6255,135 +7223,137 @@ def describe_installations_integrated(sensor_data, sensor_name, start_timestamp,
         sensor_data, sensor_name, start_timestamp, end_timestamp, process_installations_window
     )
     
-    print(f"Generated {len(narratives)} installations narratives (window size: {sensor_integration_time_window} minutes)")
+    log_info(f"Generated {len(narratives)} installations narratives (window size: {sensor_integration_time_window} minutes)")
     return narratives
 
-def split_description_by_days(description_file_path, daily_output_dir):
-    """
-    Split description file by days and save each day's content to separate files.
-    
-    Args:
-        description_file_path (str): Path to the input description file
-        daily_output_dir (str): Directory to save daily output files
-    
-    Returns:
-        dict: Dictionary mapping dates to their output file paths
-    """
-    import os
-    import re
-    from datetime import datetime
-    
-    # Create output directory if it doesn't exist
-    os.makedirs(daily_output_dir, exist_ok=True)
-    
-    # Read the entire description file
-    with open(description_file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Split content by windows - look for window headers
-    window_pattern = r'(Window \d+\nDay \d{4}-\d{2}-\d{2} \(.*?\)\n\d{2}:\d{2}:\d{2} - \d{2}:\d{2}:\d{2})'
-    windows = re.split(window_pattern, content)
-    
-    # Group windows by day
-    daily_windows = {}
-    current_day = None
-    current_content = ""
-    
-    for i, window in enumerate(windows):
-        if window.startswith('Window '):
-            # Extract date from the window header
-            date_match = re.search(r'Day (\d{4}-\d{2}-\d{2})', window)
-            if date_match:
-                day_date = date_match.group(1)
-                
-                # If we have content from a previous day, save it
-                if current_day and current_content.strip():
-                    if current_day not in daily_windows:
-                        daily_windows[current_day] = ""
-                    daily_windows[current_day] += current_content.strip() + "\n\n"
-                
-                # Start new day
-                current_day = day_date
-                current_content = window
-            else:
-                # If no date found, append to current content
-                current_content += window
-        else:
-            # This is the content between windows
-            current_content += window
-    
-    # Save the last day's content
-    if current_day and current_content.strip():
-        if current_day not in daily_windows:
-            daily_windows[current_day] = ""
-        daily_windows[current_day] += current_content.strip()
-    
-    # Write each day's content to a separate file
-    output_files = {}
-    for day_date, day_content in daily_windows.items():
-        # Create filename with date
-        filename = f"day_{day_date}.txt"
-        file_path = os.path.join(daily_output_dir, filename)
-        
-        # Write content to file
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(day_content)
-        
-        output_files[day_date] = file_path
-    
-    return output_files
+
 
 if __name__ == "__main__":
-    print("Start narrating sensor data for multiple participants...")
+    # Set up logging with minimal console output (only errors and summaries)
+    main_logger = setup_logging(console_level=logging.ERROR)
     
-    # Load app_package_pairs.jsonl from resources folder for future package name to application name mapping
-    # This is loaded once and shared across all participants
-    app_package_file_path = os.path.join("resources", "app_package_pairs.jsonl")
+    # Check processing mode
+    mode = CONFIG.get("MODE", "manual").lower()
+    log_summary(f"Start narrating sensor data in {mode.upper()} mode...")
     
-    try:
-        with open(app_package_file_path, 'r', encoding='utf-8') as file:
-            for line in file:
-                line = line.strip()
-                if line:  # Skip empty lines
-                    app_data = json.loads(line)
-                    package_name = app_data.get("package_name")
-                    application_name = app_data.get("application_name")
-                    if package_name and application_name:
-                        application_name_list[package_name] = application_name
-        print(f"Loaded {len(application_name_list)} app package mappings")
-    except FileNotFoundError:
-        print(f"Warning: App package pairs file {app_package_file_path} not found")
-        application_name_list = {}
-    except Exception as e:
-        print(f"Error reading app package pairs file: {e}")
-        application_name_list = {}
+    # App package mapping is now loaded globally at module import
+    # Using the global application_name_list variable
     
-    # Process each participant
-    successful_participants = []
-    failed_participants = []
-    
-    for P_ID in P_IDs:
+    # Process based on mode
+    if mode == "auto":
+        # Auto mode: Process participants using survey time file and time ranges
+        direction = CONFIG.get("direction", "backward")
+        log_summary(f"Running in AUTO mode with survey time file: {CONFIG['survey_time_file']}")
+        if "time_range_start" in CONFIG and "time_range_end" in CONFIG:
+            time_ranges_display = f"{CONFIG['time_range_start']} to {CONFIG['time_range_end']}"
+        else:
+            time_ranges_display = str(CONFIG.get('time_ranges', []))
+        log_summary(f"Time ranges: {time_ranges_display}, Direction: {direction}")
+        
+        success = process_auto_mode()
+        
+        # Auto mode already prints its own detailed summary
+        if not success:
+            log_summary(f"\n{'='*60}")
+            log_summary("AUTO MODE PROCESSING FAILED")
+            log_summary(f"{'='*60}")
+            log_summary("✗ No participants were successfully processed")
+        
+    else:
+        # Manual mode: Process each participant with fixed time range
+        P_IDs = CONFIG["P_IDs"]  # Only load participant IDs in manual mode
+        log_summary(f"Running in MANUAL mode with participants: {P_IDs}")
+        log_summary(f"Time range: {CONFIG['START_TIME']} to {CONFIG['END_TIME']}")
+        
+        successful_participants = []
+        failed_participants = []
+
+        num_workers = CONFIG.get("num_workers", 1)
+
+        if num_workers > 1:
+            log_summary(f"Processing {len(P_IDs)} participants in parallel (num_workers={num_workers})")
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(process_participant_manual, pid): pid
+                    for pid in P_IDs
+                }
+                for future in as_completed(futures):
+                    pid = futures[future]
+                    try:
+                        success = future.result()
+                        if success:
+                            successful_participants.append(pid)
+                            log_summary(f"FINISHED participant: {pid}")
+                            log_summary(f"{'='*50}")
+                        else:
+                            failed_participants.append(pid)
+                    except Exception as e:
+                        log_error(f"Error processing participant {pid}: {e}")
+                        failed_participants.append(pid)
+        else:
+            for pid in P_IDs:
+                try:
+                    success = process_participant_manual(pid)
+                    if success:
+                        successful_participants.append(pid)
+                        log_summary(f"FINISHED participant: {pid}")
+                        log_summary(f"{'='*50}")
+                    else:
+                        failed_participants.append(pid)
+                except Exception as e:
+                    log_error(f"Error processing participant {pid}: {e}")
+                    failed_participants.append(pid)
+        
+        # Print summary for manual mode
+        log_summary(f"\n{'='*60}")
+        log_summary("MANUAL MODE PROCESSING SUMMARY")
+        log_summary(f"{'='*60}")
+        log_summary(f"Successfully processed: {len(successful_participants)} participants")
+        if successful_participants:
+            log_summary(f"  - {', '.join(successful_participants)}")
+        
+        log_summary(f"Failed to process: {len(failed_participants)} participants")
+        if failed_participants:
+            log_summary(f"  - {', '.join(failed_participants)}")
+        
+        log_summary(f"\nTotal participants: {len(P_IDs)}")
+        
+        # Save summary to file for manual mode
         try:
-            success = process_participant(P_ID)
-            if success:
-                successful_participants.append(P_ID)
-            else:
-                failed_participants.append(P_ID)
+            # Use the base output directory (without P_ID formatting)
+            base_output_dir = CONFIG["output_dir"].replace("/{P_ID}", "")
+            summary_file = os.path.join(base_output_dir, "processing_summary.txt")
+            os.makedirs(base_output_dir, exist_ok=True)
+            
+            # Add timestamp to the summary
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Build summary lines
+            summary_lines = []
+            summary_lines.append("MANUAL MODE PROCESSING SUMMARY")
+            summary_lines.append("="*60)
+            summary_lines.append(f"Successfully processed: {len(successful_participants)} participants")
+            if successful_participants:
+                summary_lines.append(f"  - {', '.join(successful_participants)}")
+            
+            summary_lines.append(f"Failed to process: {len(failed_participants)} participants")
+            if failed_participants:
+                summary_lines.append(f"  - {', '.join(failed_participants)}")
+            
+            summary_lines.append(f"\nTotal participants: {len(P_IDs)}")
+            summary_lines.append(f"Time range: {CONFIG['START_TIME']} to {CONFIG['END_TIME']}")
+            summary_lines.append(f"JSON output: description/{{P_ID}}/{{P_ID}}_manual.json")
+            
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                f.write(f"Processing completed at: {timestamp}\n")
+                f.write(f"Mode: Manual\n")
+                f.write(f"Time range: {CONFIG['START_TIME']} to {CONFIG['END_TIME']}\n\n")
+                f.write('\n'.join(summary_lines))
+            
+            log_info(f"\n✓ Summary saved to: {summary_file}", main_logger)
+            
         except Exception as e:
-            print(f"Error processing participant {P_ID}: {e}")
-            failed_participants.append(P_ID)
+            log_warning(f"\n⚠️  Warning: Could not save summary to file: {e}", main_logger)
     
-    # Print summary
-    print(f"\n{'='*60}")
-    print("PROCESSING SUMMARY")
-    print(f"{'='*60}")
-    print(f"Successfully processed: {len(successful_participants)} participants")
-    if successful_participants:
-        print(f"  - {', '.join(successful_participants)}")
-    
-    print(f"Failed to process: {len(failed_participants)} participants")
-    if failed_participants:
-        print(f"  - {', '.join(failed_participants)}")
-    
-    print(f"\nTotal participants: {len(P_IDs)}")
-    print("Sensor narration completed!")
+    log_summary("Sensor narration completed!")
