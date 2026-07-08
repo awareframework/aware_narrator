@@ -31,7 +31,10 @@ dependencies:
       # Geographic and location processing
       - geopy
       - googlemaps
-      
+
       # Configuration and time handling
       - PyYAML
       - pytz
+
+      # Text encoding cleanup
+      - ftfy
